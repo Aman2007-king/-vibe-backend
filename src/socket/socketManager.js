@@ -22,8 +22,8 @@ function initSocket(io) {
   io.on('connection', (socket) => {
     const userId = socket.user._id.toString();
     console.log('🟢', socket.user.username, 'connected');
-
-if (!onlineUsers.has(userId)) onlineUsers.set(userId, new Set());
+ 
+    if (!onlineUsers.has(userId)) onlineUsers.set(userId, new Set());
     onlineUsers.get(userId).add(socket.id);
     socket.join('user:' + userId);
     notifyFollowersOnline(io, socket.user, true);
@@ -34,15 +34,6 @@ if (!onlineUsers.has(userId)) onlineUsers.set(userId, new Set());
       followers.forEach(fid => {
         io.to('user:' + fid).emit('feed_new_post', { post: data.post, fromUser: { id: userId, username: socket.user.username, avatar: socket.user.avatar } });
       });
-      socket.broadcast.emit('explore_new_post', data.post);
-    });
- 
-    socket.on('post_like', (data) => {
-      io.emit('post_like_update', { postId: data.postId, likesCount: data.likesCount, liked: data.liked, byUser: { id: userId, username: socket.user.username } });
-      if (data.postOwnerId && data.postOwnerId !== userId) {
-        io.to('user:' + data.postOwnerId).emit('notification', { type: 'like', fromUser: { id: userId, username: socket.user.username, avatar: socket.user.avatar }, postId: data.postId, message: socket.user.username + ' liked your photo', ts: Date.now() });
-      }
- });
       socket.broadcast.emit('explore_new_post', data.post);
     });
  
@@ -80,7 +71,7 @@ if (!onlineUsers.has(userId)) onlineUsers.set(userId, new Set());
       const key = data.conversationId + ':' + userId;
       clearTimeout(typingTimers.get(key));
       typingTimers.set(key, setTimeout(() => {
-socket.to('conv:' + data.conversationId).emit('user_typing', { conversationId: data.conversationId, user: { id: userId, username: socket.user.username }, isTyping: false });
+        socket.to('conv:' + data.conversationId).emit('user_typing', { conversationId: data.conversationId, user: { id: userId, username: socket.user.username }, isTyping: false });
       }, 5000));
     });
  
@@ -97,7 +88,7 @@ socket.to('conv:' + data.conversationId).emit('user_typing', { conversationId: d
  
     socket.on('story_view', (data) => {
       io.to('user:' + data.storyOwnerId).emit('story_viewed', { storyId: data.storyId, viewedBy: { id: userId, username: socket.user.username, avatar: socket.user.avatar }, ts: Date.now() });
- });
+    });
  
     socket.on('go_live', (data) => {
       socket.broadcast.emit('user_went_live', { user: { id: userId, username: socket.user.username, avatar: socket.user.avatar }, roomId: data.roomId, ts: Date.now() });
@@ -116,7 +107,8 @@ socket.to('conv:' + data.conversationId).emit('user_typing', { conversationId: d
       }
       io.emit('online_count', onlineUsers.size);
     });
-  };
+  });
+ 
   console.log('📡 Socket.io engine initialized');
 }
  
@@ -129,3 +121,5 @@ async function notifyFollowersOnline(io, user, isOnline) {
 function isUserOnline(userId) { return onlineUsers.has(userId.toString()); }
  
 module.exports = { initSocket, isUserOnline };
+ 
+ 
