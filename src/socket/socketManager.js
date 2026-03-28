@@ -116,7 +116,7 @@ socket.to('conv:' + data.conversationId).emit('user_typing', { conversationId: d
       }
       io.emit('online_count', onlineUsers.size);
     });
- 
+  });
   console.log('📡 Socket.io engine initialized');
 }
  
