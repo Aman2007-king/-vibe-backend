@@ -1,3 +1,4 @@
+console.log("Checking path:", require('path').resolve(__dirname, '../models/User'));
 const jwt  = require('jsonwebtoken');
 const User = require('../models/User');
  
