@@ -39,14 +39,16 @@ app.set('io', io);
 app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 app.use(compression());
 app.use(morgan('dev'));
+// In src/server.js — replace your cors() call:
 app.use(cors({
   origin: function(origin, callback) {
     const allowed = [
+      'https://vibe-frontend-ecru.vercel.app',
       process.env.CLIENT_URL,
       'http://localhost:3000',
       'http://localhost:5500',
     ].filter(Boolean);
-    if (!origin || allowed.includes(origin) || origin.includes('.vercel.app') || origin.includes('.netlify.app') || origin.includes('.glitch.me')) {
+    if (!origin || allowed.includes(origin) || origin.includes('.vercel.app') || origin.includes('.glitch.me')) {
       callback(null, true);
     } else {
       callback(null, true);
@@ -57,6 +59,9 @@ app.use(cors({
   allowedHeaders: ['Content-Type','Authorization'],
 }));
 app.options('*', cors());
+
+// Also update CLIENT_URL in Render env vars to:
+// https://vibe-frontend-ecru.vercel.app
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
