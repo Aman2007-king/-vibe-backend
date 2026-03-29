@@ -28,8 +28,6 @@ const userSchema = new mongoose.Schema({
   lastSeen:        { type: Date, default: Date.now },
 }, { timestamps: true, toJSON: { virtuals: true }, toObject: { virtuals: true } });
  
-userSchema.index({ username: 1 });
-userSchema.index({ email: 1 });
 userSchema.index({ fullName: 'text', username: 'text', bio: 'text' });
  
 userSchema.virtual('avatarUrl').get(function () {
