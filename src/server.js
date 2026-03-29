@@ -59,6 +59,12 @@ app.options('*', cors());
 // Also update CLIENT_URL in Render env vars to:
 // https://vibe-frontend-ecru.vercel.app
 app.use(express.json({ limit: '50mb' }));
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5, // Only 5 attempts allowed!
+  message: "Too many login attempts. Please try again in 15 minutes."
+});
+app.use('/api/auth/login', loginLimiter);
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
  
