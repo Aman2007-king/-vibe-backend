@@ -1,3 +1,7 @@
+app.use(cors({
+  origin: 'https://vibe-frontend-ecru.vercel.app',
+  credentials: true
+}));
 require('dotenv').config();
 const express     = require('express');
 const http        = require('http');
