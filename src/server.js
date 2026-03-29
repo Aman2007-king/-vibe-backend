@@ -1,17 +1,13 @@
-app.use(cors({
-  origin: 'https://vibe-frontend-ecru.vercel.app',
-  credentials: true
-}));
-require('dotenv').config();
 const express     = require('express');
+const cors        = require('cors');
+const path        = require('path');
+require('dotenv').config();
 const http        = require('http');
 const { Server }  = require('socket.io');
 const mongoose    = require('mongoose');
-const cors        = require('cors');
 const helmet      = require('helmet');
 const compression = require('compression');
 const morgan      = require('morgan');
-const path        = require('path');
 const rateLimit   = require('express-rate-limit');
  
 const { initSocket }  = require('./socket/socketManager');
