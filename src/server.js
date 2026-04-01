@@ -39,6 +39,24 @@ const io = new Server(server, {
 });
 
 app.set('io', io);
+// Add after other middleware
+const { 
+  csrfProtection, 
+  authLimiter, 
+  apiLimiter, 
+  advancedXSS 
+} = require('./middleware/security');
+
+// Apply enhanced security middleware
+app.use(advancedXSS);
+app.use(csrfProtection);
+
+// Apply rate limiting to auth routes specifically
+app.use('/api/auth/login', authLimiter);
+app.use('/api/auth/register', authLimiter);
+
+// Apply general API rate limiting
+app.use('/api/', apiLimiter);
 
 // Security middleware
 app.use(helmet({ 
