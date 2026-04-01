@@ -122,7 +122,43 @@ const userSchema = new mongoose.Schema({
     type: Date, 
     default: Date.now 
   },
-}, { 
+// Add THESE FIELDS to the existing userSchema object:
+followRequests: [{ 
+  type: mongoose.Schema.Types.ObjectId, 
+  ref: 'User' 
+}],
+blockedUsers: [{ 
+  type: mongoose.Schema.Types.ObjectId, 
+  ref: 'User' 
+}],
+privacySettings: {
+  profileVisibility: { 
+    type: String, 
+    enum: ['public', 'private', 'followers'], 
+    default: 'public' 
+  },
+  storyVisibility: { 
+    type: String, 
+    enum: ['public', 'closeFriends', 'followers'], 
+    default: 'public' 
+  },
+  messagePermissions: { 
+    type: String, 
+    enum: ['everyone', 'followers', 'following'], 
+    default: 'everyone' 
+  }
+},
+closeFriends: [{ 
+  type: mongoose.Schema.Types.ObjectId, 
+  ref: 'User' 
+}],
+activityLog: [{
+  action: String,
+  target: { type: mongoose.Schema.Types.ObjectId },
+  targetType: String,
+  timestamp: { type: Date, default: Date.now }
+}]
+ { 
   timestamps: true, 
   toJSON: { virtuals: true }, 
   toObject: { virtuals: true } 
