@@ -286,5 +286,139 @@ router_groups.post('/', protect, async (req, res) => {
     res.status(201).json({ success: true, group });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
- 
+ // Handle follow requests
+router_users.post('/:id/follow-request/:action', protect, async (req, res) => {
+  try {
+    const { action } = req.params; // 'accept' or 'reject'
+    const targetUser = await User.findById(req.user._id);
+    const requestingUser = await User.findById(req.params.id);
+    
+    if (!targetUser || !requestingUser) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+    
+    // Remove from follow requests
+    targetUser.followRequests.pull(requestingUser._id);
+    
+    if (action === 'accept') {
+      // Add to followers
+      targetUser.followers.push(requestingUser._id);
+      requestingUser.following.push(targetUser._id);
+      targetUser.followersCount++;
+      requestingUser.followingCount++;
+      
+      // Send acceptance notification
+      const notification = await Notification.create({
+        recipient: requestingUser._id,
+        sender: targetUser._id,
+        type: 'follow_request_accepted',
+        message: `${targetUser.username} accepted your follow request`
+      });
+      const io = req.app.get('io');
+      const populatedNotif = await notification.populate('sender', 'username avatar');
+      io.to('user:' + requestingUser._id).emit('notification', populatedNotif);
+    }
+    
+    await Promise.all([
+      targetUser.save({ validateBeforeSave: false }),
+      requestingUser.save({ validateBeforeSave: false })
+    ]);
+    
+    res.json({ 
+      success: true, 
+      message: `Follow request ${action}ed` 
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// Block/Unblock users
+router_users.post('/:id/block', protect, async (req, res) => {
+  try {
+    const targetUserId = req.params.id;
+    const currentUser = await User.findById(req.user._id);
+    
+    if (targetUserId === req.user._id.toString()) {
+      return res.status(400).json({ success: false, message: "Can't block yourself" });
+    }
+    
+    const isBlocked = currentUser.blockedUsers.includes(targetUserId);
+    
+    if (isBlocked) {
+      // Unblock
+      currentUser.blockedUsers.pull(targetUserId);
+    } else {
+      // Block
+      currentUser.blockedUsers.push(targetUserId);
+      // Also unfollow each other
+      currentUser.following.pull(targetUserId);
+      await User.findByIdAndUpdate(targetUserId, {
+        $pull: { followers: currentUser._id }
+      });
+    }
+    
+    await currentUser.save({ validateBeforeSave: false });
+    
+    res.json({
+      success: true,
+      blocked: !isBlocked,
+      message: isBlocked ? 'User unblocked' : 'User blocked'
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// Close Friends management
+router_users.post('/close-friends/:id', protect, async (req, res) => {
+  try {
+    const targetUserId = req.params.id;
+    const currentUser = await User.findById(req.user._id);
+    
+    const isCloseFriend = currentUser.closeFriends.includes(targetUserId);
+    
+    if (isCloseFriend) {
+      currentUser.closeFriends.pull(targetUserId);
+    } else {
+      currentUser.closeFriends.push(targetUserId);
+    }
+    
+    await currentUser.save({ validateBeforeSave: false });
+    
+    res.json({
+      success: true,
+      isCloseFriend: !isClosedFriend,
+      message: isCloseFriend ? 'Removed from close friends' : 'Added to close friends'
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// Privacy settings update
+router_users.put('/privacy-settings', protect, async (req, res) => {
+  try {
+    const { profileVisibility, storyVisibility, messagePermissions } = req.body;
+    const user = await User.findByIdAndUpdate(
+      req.user._id,
+      {
+        privacySettings: {
+          profileVisibility: profileVisibility || 'public',
+          storyVisibility: storyVisibility || 'public',
+          messagePermissions: messagePermissions || 'everyone'
+        }
+      },
+      { new: true }
+    );
+    
+    res.json({
+      success: true,
+      privacySettings: user.privacySettings
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
 module.exports = { userRoutes: router_users, commentRoutes: router_comments, messageRoutes: router_messages, storyRoutes: router_stories, notifRoutes: router_notifs, searchRoutes: router_search, exploreRoutes: router_explore, reelRoutes: router_reels, groupRoutes: router_groups };
