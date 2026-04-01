@@ -231,5 +231,20 @@ userSchema.methods.toPublicJSON = function (currentUserId) {
     stats: this.stats
   };
 };
+// Add to userSchema fields:
+twoFactorEnabled: { type: Boolean, default: false },
+twoFactorSecret: { type: String, select: false },
+backupCodes: [{ type: String, select: false }],
+loginSessions: [{
+  sessionId: String,
+  userAgent: String,
+  ip: String,
+  createdAt: { type: Date, default: Date.now },
+  expiresAt: Date,
+  isActive: { type: Boolean, default: true }
+}],
+failedLoginAttempts: { type: Number, default: 0 },
+lockoutUntil: Date,
+
 
 module.exports = mongoose.model('User', userSchema);
