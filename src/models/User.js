@@ -76,7 +76,7 @@ const userSchema = new mongoose.Schema({
     type: Number, 
     default: 0 
   },
-  blockedUsers: [{
+  blockedUsers: [{ 
     type: mongoose.Schema.Types.ObjectId, 
     ref: 'User' 
   }],
@@ -122,43 +122,57 @@ const userSchema = new mongoose.Schema({
     type: Date, 
     default: Date.now 
   },
-// Add THESE FIELDS to the existing userSchema object:
-followRequests: [{ 
-  type: mongoose.Schema.Types.ObjectId, 
-  ref: 'User' 
-}],
-blockedUsers: [{ 
-  type: mongoose.Schema.Types.ObjectId, 
-  ref: 'User' 
-}],
-privacySettings: {
-  profileVisibility: { 
-    type: String, 
-    enum: ['public', 'private', 'followers'], 
-    default: 'public' 
+  followRequests: [{ 
+    type: mongoose.Schema.Types.ObjectId, 
+    ref: 'User' 
+  }],
+  closeFriends: [{ 
+    type: mongoose.Schema.Types.ObjectId, 
+    ref: 'User' 
+  }],
+  privacySettings: {
+    profileVisibility: { 
+      type: String, 
+      enum: ['public', 'private', 'followers'], 
+      default: 'public' 
+    },
+    storyVisibility: { 
+      type: String, 
+      enum: ['public', 'closeFriends', 'followers'], 
+      default: 'public' 
+    },
+    messagePermissions: { 
+      type: String, 
+      enum: ['everyone', 'followers', 'following'], 
+      default: 'everyone' 
+    }
   },
-  storyVisibility: { 
-    type: String, 
-    enum: ['public', 'closeFriends', 'followers'], 
-    default: 'public' 
-  },
-  messagePermissions: { 
-    type: String, 
-    enum: ['everyone', 'followers', 'following'], 
-    default: 'everyone' 
-  }
-},
-closeFriends: [{ 
-  type: mongoose.Schema.Types.ObjectId, 
-  ref: 'User' 
-}],
-activityLog: [{
-  action: String,
-  target: { type: mongoose.Schema.Types.ObjectId },
-  targetType: String,
-  timestamp: { type: Date, default: Date.now }
-}]
- { 
+  activityLog: [{
+    action: String,
+    target: { type: mongoose.Schema.Types.ObjectId },
+    targetType: String,
+    timestamp: { type: Date, default: Date.now }
+  }],
+  
+  // ═══════════════════════════════════════════════════
+  // ADVANCED SECURITY FIELDS
+  // ═══════════════════════════════════════════════════
+  twoFactorEnabled: { type: Boolean, default: false },
+  twoFactorSecret: { type: String, select: false },
+  tempTwoFactorSecret: { type: String, select: false }, // Added for the setup flow
+  backupCodes: [{ type: String, select: false }],
+  loginSessions: [{
+    sessionId: String,
+    userAgent: String,
+    ip: String,
+    createdAt: { type: Date, default: Date.now },
+    expiresAt: Date,
+    isActive: { type: Boolean, default: true }
+  }],
+  failedLoginAttempts: { type: Number, default: 0 },
+  lockoutUntil: Date
+
+}, { 
   timestamps: true, 
   toJSON: { virtuals: true }, 
   toObject: { virtuals: true } 
@@ -231,20 +245,5 @@ userSchema.methods.toPublicJSON = function (currentUserId) {
     stats: this.stats
   };
 };
-// Add to userSchema fields:
-twoFactorEnabled: { type: Boolean, default: false },
-twoFactorSecret: { type: String, select: false },
-backupCodes: [{ type: String, select: false }],
-loginSessions: [{
-  sessionId: String,
-  userAgent: String,
-  ip: String,
-  createdAt: { type: Date, default: Date.now },
-  expiresAt: Date,
-  isActive: { type: Boolean, default: true }
-}],
-failedLoginAttempts: { type: Number, default: 0 },
-lockoutUntil: Date,
-
 
 module.exports = mongoose.model('User', userSchema);
