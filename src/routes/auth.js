@@ -1,21 +1,22 @@
-VIBE BACKEND — UPGRADED FOR REAL PLATFORM
-==========================================
-Replace these files in your Glitch project.
-All other files (package.json, server.js, socket, models, middleware) stay the same.
-Only replace: src/routes/auth.js  AND  src/utils/seed.js  (add seed endpoint to auth)
-
-
-=== src/routes/auth.js ===
-(REPLACE ENTIRE FILE)
-
 const router = require('express').Router();
 const { body, validationResult } = require('express-validator');
 const bcrypt = require('bcryptjs');
-const User = require('../models/User');
-const Post = require('../models/Post');
-const { Comment, Group } = require('../models/index');
-const { protect, generateToken } = require('../middleware/auth');
-const { upload, handleAvatarUpload } = require('../middleware/upload');
+const jwt = require('jsonwebtoken');
+const admin = require('firebase-admin');
+const supabase = require('../db/supabase');
+
+// Init Firebase Admin once (in server.js, but shown here for clarity)
+if (!admin.apps.length) {
+  admin.initializeApp({
+    credential: admin.credential.cert({
+      projectId: process.env.FIREBASE_PROJECT_ID,
+      clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+      privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+    }),
+  });
+}
+
+const genToken = (id) => jwt.sign({ id }, process.env.JWT_SECRET, { expiresIn: '30d' });
 
 const validate = (req, res, next) => {
   const errors = validationResult(req);
@@ -23,247 +24,154 @@ const validate = (req, res, next) => {
   next();
 };
 
-// ── REGISTER ──────────────────────────────────────────────────
+// ── GOOGLE AUTH (Firebase) ─────────────────────────────────
+// Frontend sends the Firebase ID token → backend verifies → creates/finds user
+router.post('/google', async (req, res) => {
+  try {
+    const { idToken } = req.body;
+    if (!idToken) return res.status(400).json({ success: false, message: 'ID token required' });
+
+    // Verify Firebase token
+    const decoded = await admin.auth().verifyIdToken(idToken);
+    const { uid, email, name, picture } = decoded;
+
+    // Check if user exists
+    let { data: user } = await supabase
+      .from('users')
+      .select('*')
+      .eq('firebase_uid', uid)
+      .single();
+
+    if (!user) {
+      // Auto-create user on first Google login
+      const baseUsername = (email.split('@')[0]).replace(/[^a-zA-Z0-9._]/g, '').toLowerCase();
+      let username = baseUsername;
+      let suffix = 1;
+
+      // Ensure unique username
+      while (true) {
+        const { data: existing } = await supabase.from('users').select('id').eq('username', username).single();
+        if (!existing) break;
+        username = baseUsername + suffix++;
+      }
+
+      const { data: newUser, error } = await supabase.from('users').insert({
+        firebase_uid: uid,
+        email: email.toLowerCase(),
+        full_name: name || username,
+        username,
+        avatar: picture || '',
+        verified: false,
+      }).select().single();
+
+      if (error) throw error;
+      user = newUser;
+    }
+
+    const token = genToken(user.id);
+    res.json({
+      success: true,
+      message: 'Welcome, ' + (user.full_name?.split(' ')[0] || user.username) + '!',
+      token,
+      user: formatUser(user),
+    });
+  } catch (err) {
+    console.error('Google auth error:', err);
+    res.status(401).json({ success: false, message: 'Google authentication failed.' });
+  }
+});
+
+// ── REGISTER (email/password) ─────────────────────────────
 router.post('/register',
-  upload.single('avatar'), handleAvatarUpload,
   [
-    body('username').trim().isLength({ min:3, max:30 }).withMessage('Username must be 3-30 chars').matches(/^[a-zA-Z0-9._]+$/).withMessage('Username: letters, numbers, _ . only'),
-    body('email').isEmail().normalizeEmail().withMessage('Valid email required'),
-    body('password').isLength({ min:6 }).withMessage('Password must be 6+ characters'),
-    body('fullName').trim().isLength({ min:1, max:60 }).withMessage('Full name required'),
+    body('username').trim().isLength({ min:3, max:30 }).matches(/^[a-zA-Z0-9._]+$/),
+    body('email').isEmail().normalizeEmail(),
+    body('password').isLength({ min:6 }),
+    body('fullName').trim().isLength({ min:1, max:60 }),
   ],
   validate,
   async (req, res) => {
     try {
       const { username, email, password, fullName, phone } = req.body;
-      const [eu, ee] = await Promise.all([
-        User.findOne({ username: username.toLowerCase().trim() }),
-        User.findOne({ email: email.toLowerCase().trim() })
-      ]);
-      if (eu) return res.status(409).json({ success: false, message: 'Username already taken. Try another.' });
-      if (ee) return res.status(409).json({ success: false, message: 'Email already registered. Try logging in.' });
-      const user = await User.create({
+
+      // Check uniqueness
+      const { data: existing } = await supabase.from('users')
+        .select('id, username, email')
+        .or(`username.eq.${username.toLowerCase()},email.eq.${email.toLowerCase()}`);
+
+      if (existing?.length) {
+        const taken = existing[0];
+        if (taken.username === username.toLowerCase()) return res.status(409).json({ success:false, message:'Username already taken.' });
+        return res.status(409).json({ success:false, message:'Email already registered.' });
+      }
+
+      const hashed = await bcrypt.hash(password, 12);
+      const { data: user, error } = await supabase.from('users').insert({
         username: username.toLowerCase().trim(),
         email: email.toLowerCase().trim(),
-        password,
-        fullName: fullName.trim(),
+        password: hashed,
+        full_name: fullName.trim(),
         phone: phone || '',
-        avatar: req.avatarFilename || ''
-      });
-      const token = generateToken(user._id);
-      res.status(201).json({
-        success: true,
-        message: 'Welcome to Vibe!',
-        token,
-        user: {
-          id: user._id,
-          username: user.username,
-          fullName: user.fullName,
-          email: user.email,
-          avatar: user.avatarUrl,
-          bio: user.bio || '',
-          verified: user.verified,
-          followersCount: 0,
-          followingCount: 0,
-          postsCount: 0
-        }
-      });
+      }).select().single();
+
+      if (error) throw error;
+
+      const token = genToken(user.id);
+      res.status(201).json({ success:true, message:'Welcome to Vibe!', token, user: formatUser(user) });
     } catch (err) {
       console.error('Register error:', err);
-      if (err.code === 11000) {
-        const field = Object.keys(err.keyPattern || {})[0] || 'field';
-        return res.status(409).json({ success: false, message: field + ' already exists.' });
-      }
-      res.status(500).json({ success: false, message: 'Registration failed. Please try again.' });
+      res.status(500).json({ success:false, message:'Registration failed.' });
     }
   }
 );
 
-// ── LOGIN ─────────────────────────────────────────────────────
+// ── LOGIN ─────────────────────────────────────────────────
 router.post('/login',
-  [
-    body('identifier').trim().notEmpty().withMessage('Username or email required'),
-    body('password').notEmpty().withMessage('Password required'),
-  ],
+  [body('identifier').trim().notEmpty(), body('password').notEmpty()],
   validate,
   async (req, res) => {
     try {
       const { identifier, password } = req.body;
       const isEmail = identifier.includes('@');
-      const user = await User.findOne(
-        isEmail ? { email: identifier.toLowerCase().trim() } : { username: identifier.toLowerCase().trim() }
-      ).select('+password');
-      if (!user || !(await user.comparePassword(password))) {
-        return res.status(401).json({ success: false, message: 'Incorrect username or password.' });
-      }
-      if (!user.isActive) return res.status(403).json({ success: false, message: 'Account deactivated.' });
-      user.lastSeen = new Date();
-      await user.save({ validateBeforeSave: false });
-      const token = generateToken(user._id);
-      res.json({
-        success: true,
-        message: 'Welcome back, ' + user.fullName.split(' ')[0] + '!',
-        token,
-        user: {
-          id: user._id,
-          username: user.username,
-          fullName: user.fullName,
-          email: user.email,
-          avatar: user.avatarUrl,
-          bio: user.bio || '',
-          website: user.website || '',
-          location: user.location || '',
-          verified: user.verified,
-          isPrivate: user.isPrivate,
-          followersCount: user.followersCount,
-          followingCount: user.followingCount,
-          postsCount: user.postsCount
-        }
-      });
+
+      const { data: user } = await supabase.from('users')
+        .select('*')
+        .eq(isEmail ? 'email' : 'username', identifier.toLowerCase().trim())
+        .single();
+
+      if (!user || !user.password) return res.status(401).json({ success:false, message:'Incorrect username or password.' });
+      if (!await bcrypt.compare(password, user.password)) return res.status(401).json({ success:false, message:'Incorrect username or password.' });
+      if (!user.is_active) return res.status(403).json({ success:false, message:'Account deactivated.' });
+
+      await supabase.from('users').update({ last_seen: new Date() }).eq('id', user.id);
+      const token = genToken(user.id);
+      res.json({ success:true, message:'Welcome back, ' + user.full_name.split(' ')[0] + '!', token, user: formatUser(user) });
     } catch (err) {
-      console.error('Login error:', err);
-      res.status(500).json({ success: false, message: 'Login failed. Please try again.' });
+      res.status(500).json({ success:false, message:'Login failed.' });
     }
   }
 );
 
-// ── GET ME ────────────────────────────────────────────────────
-router.get('/me', protect, async (req, res) => {
-  const user = await User.findById(req.user._id);
-  if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
-  user.lastSeen = new Date();
-  await user.save({ validateBeforeSave: false });
-  res.json({ success: true, user: user.toPublicJSON(user._id) });
+// ── GET ME ────────────────────────────────────────────────
+router.get('/me', require('../middleware/auth').protect, async (req, res) => {
+  const { data: user } = await supabase.from('users').select('*').eq('id', req.user.id).single();
+  if (!user) return res.status(404).json({ success:false, message:'User not found.' });
+  res.json({ success:true, user: formatUser(user) });
 });
 
-// ── LOGOUT ────────────────────────────────────────────────────
-router.post('/logout', protect, async (req, res) => {
-  await User.findByIdAndUpdate(req.user._id, { lastSeen: new Date() });
-  res.json({ success: true, message: 'Logged out successfully.' });
+router.post('/logout', require('../middleware/auth').protect, async (req, res) => {
+  await supabase.from('users').update({ last_seen: new Date() }).eq('id', req.user.id);
+  res.json({ success:true, message:'Logged out successfully.' });
 });
 
-// ── CHECK USERNAME ────────────────────────────────────────────
-router.get('/check-username/:username', async (req, res) => {
-  const u = req.params.username.toLowerCase().trim();
-  if (u.length < 3 || !/^[a-zA-Z0-9._]+$/.test(u)) return res.json({ success: true, available: false, message: 'Invalid format' });
-  const exists = await User.findOne({ username: u });
-  res.json({ success: true, available: !exists, message: exists ? 'Username taken' : 'Username available!' });
-});
-
-// ── SEED DEMO DATA ────────────────────────────────────────────
-// Call POST /api/auth/seed-demo once to populate your database
-router.post('/seed-demo', async (req, res) => {
-  try {
-    const count = await User.countDocuments();
-    if (count > 0) {
-      return res.json({ success: true, alreadySeeded: true, message: 'Database already has ' + count + ' users.' });
-    }
-
-    const AVATARS = [
-      'https://i.pravatar.cc/150?img=1',
-      'https://i.pravatar.cc/150?img=5',
-      'https://i.pravatar.cc/150?img=3',
-      'https://i.pravatar.cc/150?img=9',
-      'https://i.pravatar.cc/150?img=7',
-      'https://i.pravatar.cc/150?img=10',
-      'https://i.pravatar.cc/150?img=8',
-    ];
-    const IMGS = [
-      'https://picsum.photos/seed/p1/600/600',
-      'https://picsum.photos/seed/p2/600/600',
-      'https://picsum.photos/seed/p3/600/600',
-      'https://picsum.photos/seed/p4/600/600',
-      'https://picsum.photos/seed/p5/600/600',
-      'https://picsum.photos/seed/p6/600/600',
-    ];
-    const CAPTIONS = [
-      'Golden hour never gets old 🌅 #photography #nature',
-      'Exploring hidden gems ✈️ #adventure #travel',
-      'This view is unreal 😍 #wanderlust',
-      'Weekend energy 🎉 #vibes #lifestyle',
-      'Making memories that last forever 💫',
-      'Chasing sunsets 🌅 #travel',
-    ];
-    const LOCATIONS = ['Paris 🗼', 'Tokyo 🏯', 'New York 🗽', 'Bali 🌺', 'London 🎡', 'Mumbai 🌊'];
-
-    const DEMO_USERS = [
-      { username: 'alex.travels', fullName: 'Alex Johnson',  email: 'alex@vibe.app',  password: 'password123', bio: '📸 Photographer | 🌍 Explorer', verified: true  },
-      { username: 'sara_art',     fullName: 'Sara Williams', email: 'sara@vibe.app',  password: 'password123', bio: 'Artist & dreamer 🎨',           verified: false },
-      { username: 'mike_lens',    fullName: 'Mike Chen',     email: 'mike@vibe.app',  password: 'password123', bio: 'Street photography 🏙️',         verified: true  },
-      { username: 'luna_vibes',   fullName: 'Luna Reyes',    email: 'luna@vibe.app',  password: 'password123', bio: 'Living my best life ✨',          verified: false },
-      { username: 'jay_fit',      fullName: 'Jay Kumar',     email: 'jay@vibe.app',   password: 'password123', bio: 'Fitness coach 💪',               verified: true  },
-      { username: 'nadia_eats',   fullName: 'Nadia Patel',   email: 'nadia@vibe.app', password: 'password123', bio: 'Food blogger 🍜',               verified: false },
-      { username: 'demo',         fullName: 'Demo User',     email: 'demo@vibe.app',  password: 'demo',        bio: 'Testing Vibe! 👋',              verified: false },
-    ];
-
-    const hashed = await Promise.all(DEMO_USERS.map(async (u, i) => ({
-      ...u,
-      password: await bcrypt.hash(u.password, 12),
-      avatar: AVATARS[i],
-      postsCount:      Math.floor(Math.random() * 200) + 50,
-      followersCount:  Math.floor(Math.random() * 10000) + 100,
-      followingCount:  Math.floor(Math.random() * 500) + 50,
-    })));
-
-    const users = await User.insertMany(hashed);
-
-    // Follow relationships
-    for (let i = 0; i < users.length - 1; i++) {
-      for (let j = i + 1; j < users.length; j++) {
-        if (Math.random() > 0.3) {
-          users[i].following.push(users[j]._id);
-          users[j].followers.push(users[i]._id);
-        }
-      }
-    }
-    await Promise.all(users.map(u => u.save({ validateBeforeSave: false })));
-
-    // Posts
-    const posts = [];
-    for (let i = 0; i < 40; i++) {
-      const user = users[i % (users.length - 1)];
-      const isReel = Math.random() > 0.65;
-      posts.push({
-        user: user._id,
-        type: isReel ? 'reel' : 'post',
-        media: [{ url: IMGS[i % IMGS.length], type: 'image', width: 600, height: 600 }],
-        caption: CAPTIONS[i % CAPTIONS.length],
-        location: LOCATIONS[i % LOCATIONS.length],
-        tags: ['vibe', 'photography', 'travel'].slice(0, Math.floor(Math.random() * 3) + 1),
-        likes: users.slice(0, Math.floor(Math.random() * users.length)).map(u => u._id),
-        likesCount:    Math.floor(Math.random() * 3000) + 100,
-        commentsCount: Math.floor(Math.random() * 200) + 5,
-        savesCount:    Math.floor(Math.random() * 500),
-        viewsCount:    isReel ? Math.floor(Math.random() * 100000) + 1000 : 0,
-        engagementScore: Math.floor(Math.random() * 5000) + 100,
-        audio: isReel ? { title: 'Original Audio', artist: user.username } : undefined,
-        createdAt: new Date(Date.now() - Math.random() * 7 * 24 * 60 * 60 * 1000),
-      });
-    }
-    await Post.insertMany(posts);
-
-    // Groups
-    await Group.insertMany([
-      { name: 'Photography Lovers', description: 'A community for photography enthusiasts worldwide.', privacy: 'public', category: 'Photography', admin: users[0]._id, members: [users[0]._id, users[1]._id], membersCount: 2 },
-      { name: 'Travel & Adventure',  description: 'Share your travel stories and tips.',               privacy: 'public', category: 'Travel',       admin: users[1]._id, members: [users[1]._id, users[2]._id], membersCount: 2 },
-      { name: 'Foodies United',      description: 'For people who live to eat great food.',             privacy: 'public', category: 'Food',          admin: users[2]._id, members: [users[2]._id],               membersCount: 1 },
-      { name: 'Fitness & Wellness',  description: 'Health, fitness and wellness community.',            privacy: 'public', category: 'Fitness',       admin: users[4]._id, members: [users[4]._id],               membersCount: 1 },
-    ]);
-
-    res.json({
-      success: true,
-      message: '🎉 Demo data seeded successfully!',
-      stats: { users: users.length, posts: 40, groups: 4 },
-      testLogins: [
-        { username: 'demo',         password: 'demo',        note: 'Main demo account' },
-        { username: 'alex.travels', password: 'password123', note: 'Verified photographer' },
-        { username: 'sara_art',     password: 'password123', note: 'Artist account' },
-      ]
-    });
-  } catch (err) {
-    console.error('Seed error:', err);
-    res.status(500).json({ success: false, message: 'Seed failed: ' + err.message });
-  }
-});
+function formatUser(u) {
+  return {
+    id: u.id, username: u.username, fullName: u.full_name,
+    email: u.email, avatar: u.avatar || `https://ui-avatars.com/api/?name=${encodeURIComponent(u.full_name)}&background=random`,
+    bio: u.bio || '', website: u.website || '', location: u.location || '',
+    verified: u.verified, isPrivate: u.is_private,
+    followersCount: u.followers_count, followingCount: u.following_count, postsCount: u.posts_count,
+  };
+}
 
 module.exports = router;
