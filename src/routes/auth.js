@@ -151,7 +151,99 @@ router.post('/login',
     }
   }
 );
+const admin = require('firebase-admin');
 
+// Init Firebase Admin (only once)
+if (!admin.apps.length) {
+  admin.initializeApp({
+    credential: admin.credential.cert({
+      projectId:   process.env.FIREBASE_PROJECT_ID,
+      clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+      privateKey:  process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+    }),
+  });
+}
+
+// ── GOOGLE AUTH ──────────────────────────────────────────────
+router.post('/google', async (req, res) => {
+  try {
+    const { idToken } = req.body;
+    if (!idToken) return res.status(400).json({ success: false, message: 'ID token required' });
+
+    // Verify the Firebase token
+    const decoded = await admin.auth().verifyIdToken(idToken);
+    const { uid, email, name, picture } = decoded;
+
+    // Check if user already exists
+    let user = await User.findOne({ firebaseUid: uid });
+
+    if (!user) {
+      // Also check by email (in case they registered with email before)
+      user = await User.findOne({ email: email?.toLowerCase() });
+
+      if (user) {
+        // Link existing account to Google
+        user.firebaseUid = uid;
+        if (!user.avatar && picture) user.avatar = picture;
+        await user.save({ validateBeforeSave: false });
+      } else {
+        // Brand new user — create account automatically
+        let baseUsername = (email.split('@')[0])
+          .replace(/[^a-zA-Z0-9._]/g, '')
+          .toLowerCase()
+          .slice(0, 25);
+        if (!baseUsername) baseUsername = 'user';
+
+        // Make username unique
+        let username = baseUsername;
+        let counter = 1;
+        while (await User.findOne({ username })) {
+          username = baseUsername + counter++;
+        }
+
+        user = await User.create({
+          firebaseUid: uid,
+          username,
+          email:    email?.toLowerCase() || '',
+          password: Math.random().toString(36) + Math.random().toString(36), // random, never used
+          fullName: name || username,
+          avatar:   picture || '',
+          verified: false,
+        });
+      }
+    }
+
+    // Update last seen
+    user.lastSeen = new Date();
+    await user.save({ validateBeforeSave: false });
+
+    const token = generateToken(user._id);
+    res.json({
+      success: true,
+      message: 'Welcome, ' + (user.fullName?.split(' ')[0] || user.username) + '!',
+      token,
+      user: {
+        id:             user._id,
+        username:       user.username,
+        fullName:       user.fullName,
+        email:          user.email,
+        avatar:         user.avatarUrl || picture || '',
+        bio:            user.bio || '',
+        verified:       user.verified,
+        followersCount: user.followersCount || 0,
+        followingCount: user.followingCount || 0,
+        postsCount:     user.postsCount || 0,
+      }
+    });
+
+  } catch (err) {
+    console.error('Google auth error:', err.message);
+    if (err.code === 'auth/argument-error' || err.code === 'auth/invalid-id-token') {
+      return res.status(401).json({ success: false, message: 'Invalid Google token. Please try again.' });
+    }
+    res.status(500).json({ success: false, message: 'Google sign-in failed: ' + err.message });
+  }
+});
 // ── GET ME ────────────────────────────────────────────────
 router.get('/me', require('../middleware/auth').protect, async (req, res) => {
   const { data: user } = await supabase.from('users').select('*').eq('id', req.user.id).single();
