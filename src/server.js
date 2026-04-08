@@ -1,3 +1,13 @@
+const admin = require('firebase-admin');
+if (!admin.apps.length) {
+  admin.initializeApp({
+    credential: admin.credential.cert({
+      projectId: process.env.FIREBASE_PROJECT_ID,
+      clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+      privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+    }),
+  });
+}
 require('dotenv').config();
 const express = require('express');
 const http = require('http');
@@ -136,19 +146,20 @@ app.use((req, res) => {
 });
 
 // 9. DATABASE & SERVER START
-const PORT = process.env.PORT || 3000;
-mongoose.connect(process.env.MONGODB_URI)
-.then(() => {
-  logger.info('✅ MongoDB connected');
-  initSocket(io);
-  server.listen(PORT, () => {
-    logger.info(`🚀 Vibe server running on port ${PORT}`);
-  });
-})
-.catch(err => {
-  logger.error('❌ MongoDB connection error:', err);
-  process.exit(1);
-});
+// Remove: mongoose.connect(...)
+// Replace with:
 
+const PORT = process.env.PORT || 3000;
+// Test Supabase connection
+const supabase = require('./db/supabase');
+supabase.from('users').select('count').limit(1)
+  .then(({ error }) => {
+    if (error) { console.error('❌ Supabase error:', error); process.exit(1); }
+    console.log('✅ Supabase connected');
+    initSocket(io);
+    server.listen(PORT, () => {
+      console.log('🚀 Vibe server running on port', PORT);
+    });
+  });
 module.exports = { app, server, io };
       
