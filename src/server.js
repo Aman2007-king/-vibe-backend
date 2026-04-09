@@ -1,165 +1,96 @@
-const admin = require('firebase-admin');
-if (!admin.apps.length) {
-  admin.initializeApp({
-    credential: admin.credential.cert({
-      projectId: process.env.FIREBASE_PROJECT_ID,
-      clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-      privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
-    }),
-  });
-}
 require('dotenv').config();
-const express = require('express');
-const http = require('http');
-const { Server } = require('socket.io');
-const mongoose = require('mongoose');
-const cors = require('cors');
-const helmet = require('helmet');
+const express     = require('express');
+const http        = require('http');
+const { Server }  = require('socket.io');
+const cors        = require('cors');
+const helmet      = require('helmet');
 const compression = require('compression');
-const morgan = require('morgan');
-const path = require('path');
-const rateLimit = require('express-rate-limit');
+const morgan      = require('morgan');
+const path        = require('path');
+const rateLimit   = require('express-rate-limit');
 
+const supabase = require('./db/supabase');
 const { initSocket } = require('./socket/socketManager');
-const authRoutes = require('./routes/auth');
-const userRoutes = require('./routes/users');
-const postRoutes = require('./routes/posts');
-const reelRoutes = require('./routes/reels');
-const storyRoutes = require('./routes/stories');
-const commentRoutes = require('./routes/comments');
-const messageRoutes = require('./routes/messages');
-const notifRoutes = require('./routes/notifications');
-const searchRoutes = require('./routes/search');
-const groupRoutes = require('./routes/groups');
-const exploreRoutes = require('./routes/explore');
+const errorHandler   = require('./middleware/error');
 
-const logger = require('./utils/logger');
+// Routes
+const authRoutes  = require('./routes/auth');
+const postRoutes  = require('./routes/posts');
+const {
+  userRoutes, commentRoutes, messageRoutes, storyRoutes,
+  notifRoutes, searchRoutes, exploreRoutes, reelRoutes, groupRoutes,
+} = require('./routes/allRoutes');
 
-const app = express();
+const app    = express();
 const server = http.createServer(app);
 
-// 1. BASIC MIDDLEWARE (Must come first)
-app.use(helmet({ 
-  crossOriginResourcePolicy: { policy: 'cross-origin' } 
-}));
-app.use(cors({ 
-  origin: process.env.CLIENT_URL || '*', 
-  credentials: true, 
-  methods: ['GET','POST','PUT','DELETE','PATCH'] 
-}));
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
-app.use(compression());
-app.use(morgan('combined', { stream: { write: (message) => logger.info(message.trim()) } }));
+// ── SOCKET.IO ──────────────────────────────────────────
+const ALLOWED_ORIGINS = (process.env.CLIENT_URL || '*').split(',').map(s => s.trim());
 
-// 2. SOCKET.IO SETUP
 const io = new Server(server, {
-  cors: { 
-    origin: process.env.CLIENT_URL || '*', 
-    methods: ['GET','POST'], 
-    credentials: true 
-  },
+  cors: { origin: ALLOWED_ORIGINS, methods: ['GET', 'POST'], credentials: true },
   maxHttpBufferSize: 50 * 1024 * 1024,
 });
 app.set('io', io);
 
-// 3. SECURITY MIDDLEWARE IMPORTS
-const { 
-  csrfProtection, 
-  authLimiter, 
-  apiLimiter, 
-  advancedXSS 
-} = require('./middleware/security');
+// ── MIDDLEWARE ─────────────────────────────────────────
+app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
+app.use(compression());
+if (process.env.NODE_ENV !== 'production') app.use(morgan('dev'));
 
-// Apply security logic
-app.use(advancedXSS);
-// Note: If Login fails with 403, comment out csrfProtection temporarily to test
-app.use(csrfProtection); 
+app.use(cors({
+  origin: ALLOWED_ORIGINS,
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+}));
 
-// 4. LOCAL RATE LIMITERS (Renamed to avoid SyntaxError)
-const localGeneralLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, 
-  max: 200,
-  message: { success: false, message: 'Too many requests, try again later.' },
-  standardHeaders: true,
-  legacyHeaders: false
-});
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
-const localAuthLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 5,
-  message: { success: false, message: 'Too many login attempts, try again later.' },
-  standardHeaders: true,
-  legacyHeaders: false,
-  skipSuccessfulRequests: true
-});
+// ── RATE LIMITING ──────────────────────────────────────
+app.use('/api/', rateLimit({ windowMs: 15 * 60 * 1000, max: 300, standardHeaders: true, legacyHeaders: false }));
+app.use('/api/auth/', rateLimit({ windowMs: 15 * 60 * 1000, max: 20, message: { success: false, message: 'Too many requests, please wait.' } }));
 
-// Apply local limiters
-app.use('/api/', localGeneralLimiter);
-app.use('/api/auth/login', localAuthLimiter);
-app.use('/api/auth/register', localAuthLimiter);
-
-// 5. STATIC FILES
-app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
-
-// 6. ROUTES
-app.use('/api/auth', authRoutes);
-app.use('/api/users', userRoutes);
-app.use('/api/posts', postRoutes);
-app.use('/api/reels', reelRoutes);
-app.use('/api/stories', storyRoutes);
-app.use('/api/comments', commentRoutes);
-app.use('/api/messages', messageRoutes);
+// ── ROUTES ─────────────────────────────────────────────
+app.use('/api/auth',          authRoutes);
+app.use('/api/users',         userRoutes);
+app.use('/api/posts',         postRoutes);
+app.use('/api/comments',      commentRoutes);
+app.use('/api/messages',      messageRoutes);
+app.use('/api/stories',       storyRoutes);
 app.use('/api/notifications', notifRoutes);
-app.use('/api/search', searchRoutes);
-app.use('/api/groups', groupRoutes);
-app.use('/api/explore', exploreRoutes);
+app.use('/api/search',        searchRoutes);
+app.use('/api/explore',       exploreRoutes);
+app.use('/api/reels',         reelRoutes);
+app.use('/api/groups',        groupRoutes);
 
-// 7. HEALTH CHECK
-app.get('/api/health', async (req, res) => {
-  try {
-    const dbState = mongoose.connection.readyState;
-    const dbStatus = dbState === 1 ? 'connected' : dbState === 2 ? 'connecting' : 'disconnected';
-    res.json({ 
-      success: true, 
-      status: 'OK', 
-      uptime: process.uptime(), 
-      database: dbStatus,
-      version: '1.0.0'
-    });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
-  }
+// ── HEALTH CHECK ───────────────────────────────────────
+app.get('/api/health', (req, res) => {
+  res.json({ success: true, status: 'OK', uptime: process.uptime(), timestamp: new Date().toISOString(), connections: io.engine.clientsCount });
 });
 
-// 8. ERROR HANDLING
-app.use((err, req, res, next) => {
-  logger.error('Error:', err.stack);
-  res.status(err.status || 500).json({ 
-    success: false, 
-    message: err.message || 'Internal Server Error' 
-  });
-});
+// ── 404 ────────────────────────────────────────────────
+app.use((req, res) => res.status(404).json({ success: false, message: 'Route not found' }));
 
-app.use((req, res) => {
-  res.status(404).json({ success: false, message: 'Route not found' });
-});
+// ── ERROR HANDLER ──────────────────────────────────────
+app.use(errorHandler);
 
-// 9. DATABASE & SERVER START
-// Remove: mongoose.connect(...)
-// Replace with:
-
+// ── START SERVER ───────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-// Test Supabase connection
-const supabase = require('./db/supabase');
+
 supabase.from('users').select('count').limit(1)
   .then(({ error }) => {
-    if (error) { console.error('❌ Supabase error:', error); process.exit(1); }
+    if (error) {
+      console.error('❌ Supabase connection failed:', error.message);
+      process.exit(1);
+    }
     console.log('✅ Supabase connected');
     initSocket(io);
     server.listen(PORT, () => {
-      console.log('🚀 Vibe server running on port', PORT);
+      console.log(`🚀 Vibe backend running on port ${PORT}`);
+      console.log(`📡 Socket.io ready`);
+      console.log(`🌍 Allowed origins: ${ALLOWED_ORIGINS.join(', ')}`);
     });
   });
+
 module.exports = { app, server, io };
-      
