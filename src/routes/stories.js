@@ -1,100 +1,66 @@
-const express = require('express');
-const router = express.Router();
-const { Story } = require('../models/index');
-const User = require('../models/User');
-const { protect, optionalAuth } = require('../middleware/auth');
+const router   = require('express').Router();
+const supabase = require('../db/supabase');
+const { protect } = require('../middleware/auth');
 const { upload, handleStoryUpload } = require('../middleware/upload');
 
-// GET stories feed
 router.get('/feed', protect, async (req, res) => {
   try {
-    const me = await User.findById(req.user._id).select('following');
-    const ids = [...(me.following||[]), req.user._id];
-    
-    const stories = await Story.find({ 
-      user: { $in: ids }, 
-      isDeleted: false, 
-      expiresAt: { $gt: new Date() } 
-    })
-      .populate('user', 'username avatar verified')
-      .sort({ createdAt: -1 });
-      
+    const { data:follows } = await supabase.from('follows').select('following_id').eq('follower_id',req.user.id);
+    const userIds = [...(follows||[]).map(f=>f.following_id), req.user.id];
+    const { data:stories } = await supabase.from('stories')
+      .select('*, users!user_id(id,username,full_name,avatar,verified)')
+      .in('user_id',userIds).eq('is_deleted',false)
+      .gt('expires_at',new Date().toISOString()).order('created_at',{ascending:false});
     const grouped = {};
-    stories.forEach(s => {
-      const uid = s.user._id.toString();
-      if (!grouped[uid]) {
-        grouped[uid] = { user: s.user, stories: [], hasUnread: false };
-      }
-      
-      const seen = s.viewers?.some(v => v.user?.toString() === req.user._id.toString());
-      grouped[uid].stories.push({ ...s.toObject(), seen });
-      if (!seen) grouped[uid].hasUnread = true;
+    (stories||[]).forEach(s=>{
+      const uid=s.user_id;
+      if(!grouped[uid]) grouped[uid]={ user:{ id:s.users?.id, username:s.users?.username, fullName:s.users?.full_name, avatar:s.users?.avatar||'', verified:s.users?.verified||false }, stories:[], hasUnread:false };
+      grouped[uid].stories.push({ ...s, media:s.media||{} });
+      const viewed=(s.viewers||[]).some(v=>v.user_id===req.user.id);
+      if(!viewed) grouped[uid].hasUnread=true;
     });
-    
-    res.json({ success: true, storyGroups: Object.values(grouped) });
-  } catch (e) {
-    res.status(500).json({ success: false, message: e.message });
-  }
+    res.json({ success:true, storyGroups:Object.values(grouped) });
+  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
 });
 
-// CREATE story
 router.post('/', protect, upload.single('media'), handleStoryUpload, async (req, res) => {
   try {
-    if (!req.storyFilename) return res.status(400).json({ success: false, message: 'Media required.' });
-    
-    const { text, location, audience } = req.body;
-    const story = await Story.create({ 
-      user: req.user._id, 
-      media: { 
-        url: req.storyFilename, 
-        type: req.storyIsVideo ? 'video' : 'image' 
-      }, 
-      text, 
-      location, 
-      audience: audience || 'all' 
-    });
-    
-    await User.findByIdAndUpdate(req.user._id, { $inc: { storiesCount: 1 } });
-    const populated = await story.populate('user', 'username avatar verified');
-    
-    const fullUser = await User.findById(req.user._id).select('followers');
-    fullUser.followers.forEach(fid => {
-      req.app.get('io').to('user:' + fid).emit('new_story', populated);
-    });
-    
-    res.status(201).json({ success: true, story: populated });
-  } catch (e) {
-    res.status(500).json({ success: false, message: e.message });
-  }
+    if(!req.storyMedia) return res.status(400).json({ success:false, message:'Media required.' });
+    const { data:story, error } = await supabase.from('stories').insert({
+      user_id:req.user.id, media:req.storyMedia,
+      text:req.body.text||'', location:req.body.location||'', audience:req.body.audience||'all',
+      expires_at:new Date(Date.now()+24*60*60*1000).toISOString()
+    }).select('*, users!user_id(id,username,full_name,avatar,verified)').single();
+    if(error) throw error;
+    const io=req.app.get('io');
+    const { data:follows } = await supabase.from('follows').select('follower_id').eq('following_id',req.user.id);
+    (follows||[]).forEach(f=>io?.to('user:'+f.follower_id).emit('new_story',story));
+    res.status(201).json({ success:true, story });
+  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
 });
 
-// VIEW story
 router.post('/:id/view', protect, async (req, res) => {
   try {
-    const story = await Story.findById(req.params.id);
-    if (!story) return res.status(404).json({ success: false, message: 'Story not found.' });
-    
-    const alreadyViewed = story.viewers?.some(v => v.user?.toString() === req.user._id.toString());
-    
-    if (!alreadyViewed) {
-      story.viewers.push({ user: req.user._id, viewedAt: new Date() });
-      story.viewersCount++;
-      await story.save();
-      
-      req.app.get('io').to('user:' + story.user).emit('story_viewed', {
-        storyId: story._id,
-        viewedBy: { 
-          id: req.user._id, 
-          username: req.user.username, 
-          avatar: req.user.avatarUrl 
-        }
-      });
+    const { data:story } = await supabase.from('stories').select('id,viewers,viewers_count,user_id').eq('id',req.params.id).single();
+    if(!story) return res.status(404).json({ success:false, message:'Story not found.' });
+    const viewers=story.viewers||[];
+    if(!viewers.some(v=>v.user_id===req.user.id)){
+      viewers.push({ user_id:req.user.id, viewed_at:new Date().toISOString() });
+      await supabase.from('stories').update({ viewers, viewers_count:(story.viewers_count||0)+1 }).eq('id',story.id);
+      req.app.get('io')?.to('user:'+story.user_id).emit('story_viewed',{ storyId:story.id, viewedBy:{ id:req.user.id, username:req.user.username, avatar:req.user.avatar||'' } });
     }
-    
-    res.json({ success: true });
-  } catch (e) {
-    res.status(500).json({ success: false, message: e.message });
-  }
+    res.json({ success:true });
+  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
+});
+
+router.delete('/:id', protect, async (req, res) => {
+  try {
+    const { data:story } = await supabase.from('stories').select('id,user_id').eq('id',req.params.id).single();
+    if(!story) return res.status(404).json({ success:false, message:'Story not found.' });
+    if(story.user_id!==req.user.id) return res.status(403).json({ success:false, message:'Not authorized.' });
+    await supabase.from('stories').update({ is_deleted:true }).eq('id',story.id);
+    res.json({ success:true, message:'Story deleted.' });
+  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
 });
 
 module.exports = router;
