@@ -1,663 +1,631 @@
-const router_users    = require('express').Router();
-const router_comments = require('express').Router();
-const router_messages = require('express').Router();
-const router_stories  = require('express').Router();
-const router_notifs   = require('express').Router();
-const router_search   = require('express').Router();
-const router_groups   = require('express').Router();
-const router_explore  = require('express').Router();
-const router_reels    = require('express').Router();
- 
-const User   = require('../models/User');
-const Post   = require('../models/Post');
-const { Comment, Conversation, Message, Notification, Group, Story } = require('../models/index');
+const supabase = require('../db/supabase');
 const { protect, optionalAuth } = require('../middleware/auth');
-const { upload, handlePostUpload, handleStoryUpload } = require('../middleware/upload');
+const { upload, handleStoryUpload } = require('../middleware/upload');
+const { formatPost, formatNotif, formatUser } = require('../utils/helpers');
+const notify   = require('../utils/notify');
 const { isUserOnline } = require('../socket/socketManager');
- 
-// ── USERS ────────────────────────────────────────────────────
-router_users.get('/:username', optionalAuth, async (req, res) => {
-  try {
-    const user = await User.findOne({ username: req.params.username.toLowerCase() });
-    if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
-    const pub = user.toPublicJSON(req.user?._id); pub.isOnline = isUserOnline(user._id);
-    res.json({ success: true, user: pub });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
-});
- 
-router_users.put('/me', protect, upload.single('avatar'), async (req, res) => {
-  try {
-    const allowed = ['fullName','bio','website','location','isPrivate','accountType'];
-    const updates = {};
-    allowed.forEach(f => { if (req.body[f] !== undefined) updates[f] = req.body[f]; });
-    if (req.file) { const { handleAvatarUpload } = require('../middleware/upload'); req.file = req.file; await new Promise((res, rej) => handleAvatarUpload(req, {}, e => e ? rej(e) : res())); if (req.avatarFilename) updates.avatar = req.avatarFilename; }
-    const user = await User.findByIdAndUpdate(req.user._id, updates, { new: true, runValidators: true });
-    res.json({ success: true, user: { ...user.toObject(), avatar: user.avatarUrl } });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
-});
- 
-// Enhanced follow system with privacy controls
-router.post('/:id/follow', protect, async (req, res) => {
-  try {
-    if (req.params.id === req.user._id.toString()) {
-      return res.status(400).json({ success: false, message: "Can't follow yourself." });
-    }
 
-    const [targetUser, currentUser] = await Promise.all([
-      User.findById(req.params.id),
-      User.findById(req.user._id)
-    ]);
+// ═══════════════════════════════════════════════════════
+// COMMENTS
+// ═══════════════════════════════════════════════════════
+const router_comments = require('express').Router();
 
-    if (!targetUser) {
-      return res.status(404).json({ success: false, message: 'User not found.' });
-    }
-
-    // Check privacy settings
-    if (targetUser.privacySettings.profileVisibility === 'private') {
-      // Send follow request instead
-      if (!targetUser.followRequests.includes(currentUser._id)) {
-        targetUser.followRequests.push(currentUser._id);
-        await targetUser.save({ validateBeforeSave: false });
-        
-        // Log activity
-        currentUser.activityLog.push({
-          action: 'sent_follow_request',
-          target: targetUser._id,
-          targetType: 'user'
-        });
-        await currentUser.save({ validateBeforeSave: false });
-        
-        // Send notification
-        const io = req.app.get('io');
-        const notification = await Notification.create({
-          recipient: targetUser._id,
-          sender: currentUser._id,
-          type: 'follow_request',
-          message: `${currentUser.username} wants to follow you`
-        });
-        const populatedNotif = await notification.populate('sender', 'username avatar');
-        io.to('user:' + targetUser._id).emit('notification', populatedNotif);
-        
-        return res.json({ 
-          success: true, 
-          requested: true, 
-          message: 'Follow request sent' 
-        });
-      } else {
-        return res.json({ 
-          success: true, 
-          requested: true, 
-          message: 'Follow request already sent' 
-        });
-      }
-    }
-
-    // Direct follow for public accounts
-    const alreadyFollowing = currentUser.following.some(
-      id => id.toString() === targetUser._id.toString()
-    );
-
-    if (alreadyFollowing) {
-      // Unfollow
-      currentUser.following.pull(targetUser._id);
-      targetUser.followers.pull(currentUser._id);
-      currentUser.followingCount = Math.max(0, currentUser.followingCount - 1);
-      targetUser.followersCount = Math.max(0, targetUser.followersCount - 1);
-    } else {
-      // Follow
-      currentUser.following.push(targetUser._id);
-      targetUser.followers.push(currentUser._id);
-      currentUser.followingCount++;
-      targetUser.followersCount++;
-      
-      // Send notification
-      const notification = await Notification.create({
-        recipient: targetUser._id,
-        sender: currentUser._id,
-        type: 'follow',
-        message: `${currentUser.username} started following you`
-      });
-      const populatedNotif = await notification.populate('sender', 'username avatar verified');
-      const io = req.app.get('io');
-      io.to('user:' + targetUser._id).emit('notification', populatedNotif);
-      io.to('user:' + targetUser._id).emit('new_follower', {
-        from: { 
-          id: currentUser._id, 
-          username: currentUser.username, 
-          avatar: currentUser.avatarUrl 
-        }
-      });
-    }
-
-    await Promise.all([
-      currentUser.save({ validateBeforeSave: false }),
-      targetUser.save({ validateBeforeSave: false })
-    ]);
-
-    // Log activity
-    currentUser.activityLog.push({
-      action: alreadyFollowing ? 'unfollow' : 'follow',
-      target: targetUser._id,
-      targetType: 'user'
-    });
-    await currentUser.save({ validateBeforeSave: false });
-
-    res.json({
-      success: true,
-      following: !alreadyFollowing,
-      followersCount: targetUser.followersCount
-    });
-  } catch (e) {
-    res.status(500).json({ success: false, message: e.message });
-  }
-});
-
-// Handle follow requests
-router.post('/:id/follow-request/:action', protect, async (req, res) => {
-  try {
-    const { action } = req.params; // 'accept' or 'reject'
-    const targetUser = await User.findById(req.user._id);
-    const requestingUser = await User.findById(req.params.id);
-    
-    if (!targetUser || !requestingUser) {
-      return res.status(404).json({ success: false, message: 'User not found' });
-    }
-    
-    // Remove from follow requests
-    targetUser.followRequests.pull(requestingUser._id);
-    
-    if (action === 'accept') {
-      // Add to followers
-      targetUser.followers.push(requestingUser._id);
-      requestingUser.following.push(targetUser._id);
-      targetUser.followersCount++;
-      requestingUser.followingCount++;
-      
-      // Send acceptance notification
-      const notification = await Notification.create({
-        recipient: requestingUser._id,
-        sender: targetUser._id,
-        type: 'follow_request_accepted',
-        message: `${targetUser.username} accepted your follow request`
-      });
-      const io = req.app.get('io');
-      const populatedNotif = await notification.populate('sender', 'username avatar');
-      io.to('user:' + requestingUser._id).emit('notification', populatedNotif);
-    }
-    
-    await Promise.all([
-      targetUser.save({ validateBeforeSave: false }),
-      requestingUser.save({ validateBeforeSave: false })
-    ]);
-    
-    res.json({ 
-      success: true, 
-      message: `Follow request ${action}ed` 
-    });
-  } catch (e) {
-    res.status(500).json({ success: false, message: e.message });
-  }
-});
-
-// Block/Unblock users
-router.post('/:id/block', protect, async (req, res) => {
-  try {
-    const targetUserId = req.params.id;
-    const currentUser = await User.findById(req.user._id);
-    
-    if (targetUserId === req.user._id.toString()) {
-      return res.status(400).json({ success: false, message: "Can't block yourself" });
-    }
-    
-    const isBlocked = currentUser.blockedUsers.includes(targetUserId);
-    
-    if (isBlocked) {
-      // Unblock
-      currentUser.blockedUsers.pull(targetUserId);
-    } else {
-      // Block
-      currentUser.blockedUsers.push(targetUserId);
-      // Also unfollow each other
-      currentUser.following.pull(targetUserId);
-      await User.findByIdAndUpdate(targetUserId, {
-        $pull: { followers: currentUser._id }
-      });
-    }
-    
-    await currentUser.save({ validateBeforeSave: false });
-    
-    res.json({
-      success: true,
-      blocked: !isBlocked,
-      message: isBlocked ? 'User unblocked' : 'User blocked'
-    });
-  } catch (e) {
-    res.status(500).json({ success: false, message: e.message });
-  }
-});
-
-// Close Friends management
-router.post('/close-friends/:id', protect, async (req, res) => {
-  try {
-    const targetUserId = req.params.id;
-    const currentUser = await User.findById(req.user._id);
-    
-    const isCloseFriend = currentUser.closeFriends.includes(targetUserId);
-    
-    if (isCloseFriend) {
-      currentUser.closeFriends.pull(targetUserId);
-    } else {
-      currentUser.closeFriends.push(targetUserId);
-    }
-    
-    await currentUser.save({ validateBeforeSave: false });
-    
-    res.json({
-      success: true,
-      isCloseFriend: !isCloseFriend,
-      message: isCloseFriend ? 'Removed from close friends' : 'Added to close friends'
-    });
-  } catch (e) {
-    res.status(500).json({ success: false, message: e.message });
-  }
-});
-
-// Privacy settings update
-router.put('/privacy-settings', protect, async (req, res) => {
-  try {
-    const { profileVisibility, storyVisibility, messagePermissions } = req.body;
-    const user = await User.findByIdAndUpdate(
-      req.user._id,
-      {
-        privacySettings: {
-          profileVisibility: profileVisibility || 'public',
-          storyVisibility: storyVisibility || 'public',
-          messagePermissions: messagePermissions || 'everyone'
-        }
-      },
-      { new: true }
-    );
-    
-    res.json({
-      success: true,
-      privacySettings: user.privacySettings
-    });
-  } catch (e) {
-    res.status(500).json({ success: false, message: e.message });
-  }
-});
-
- 
-router_users.get('/:id/followers', optionalAuth, async (req, res) => {
-  try {
-const user = await User.findById(req.params.id).populate('followers', 'username fullName avatar verified bio followersCount');
-    if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
-    res.json({ success: true, followers: user.followers.map(u => ({ ...u.toObject(), isOnline: isUserOnline(u._id), avatar: u.avatarUrl })) });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
-});
- 
-router_users.get('/:id/following', optionalAuth, async (req, res) => {
-  try {
-    const user = await User.findById(req.params.id).populate('following', 'username fullName avatar verified bio followersCount');
-    if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
-    res.json({ success: true, following: user.following.map(u => ({ ...u.toObject(), isOnline: isUserOnline(u._id), avatar: u.avatarUrl })) });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
-});
- 
-router_users.get('/:id/suggestions', protect, async (req, res) => {
-  try {
-    const me = await User.findById(req.user._id).select('following');
-    const exclude = [...(me.following||[]), req.user._id];
-    const suggestions = await User.find({ _id: { $nin: exclude }, isActive: true }).select('username fullName avatar verified bio followersCount').sort({ followersCount: -1 }).limit(10);
-    res.json({ success: true, suggestions: suggestions.map(u => ({ ...u.toObject(), avatar: u.avatarUrl })) });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
-});
-// ── COMMENTS ─────────────────────────────────────────────────
 router_comments.get('/:postId', optionalAuth, async (req, res) => {
   try {
-    const { page = 1, limit = 20 } = req.query;
-    const comments = await Comment.find({ post: req.params.postId, parent: null, isDeleted: false }).populate('user', 'username avatar verified').sort({ createdAt: -1 }).skip((page-1)*limit).limit(+limit);
-    res.json({ success: true, comments });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    const limit  = Math.min(50, parseInt(req.query.limit) || 20);
+    const page   = Math.max(1,  parseInt(req.query.page)  || 1);
+    const offset = (page - 1) * limit;
+
+    const { data: comments } = await supabase
+      .from('comments')
+      .select(`*, users!user_id(id, username, full_name, avatar, verified)`)
+      .eq('post_id', req.params.postId)
+      .eq('is_deleted', false)
+      .is('parent_id', null)
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limit - 1);
+
+    res.json({
+      success:  true,
+      comments: (comments || []).map(c => ({
+        id: c.id, _id: c.id,
+        text:      c.text,
+        likesCount: c.likes_count || 0,
+        repliesCount: c.replies_count || 0,
+        createdAt: c.created_at,
+        user: {
+          id:       c.users?.id,
+          username: c.users?.username,
+          fullName: c.users?.full_name,
+          avatar:   c.users?.avatar || `https://ui-avatars.com/api/?name=${encodeURIComponent(c.users?.full_name || 'U')}&background=0095f6&color=fff`,
+          verified: c.users?.verified || false,
+        },
+      })),
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
 });
- 
+
 router_comments.post('/:postId', protect, async (req, res) => {
   try {
     const { text, parentId } = req.body;
     if (!text?.trim()) return res.status(400).json({ success: false, message: 'Comment text required.' });
-    const post = await Post.findById(req.params.postId).select('user commentsDisabled');
+
+    const { data: post } = await supabase.from('posts').select('id, user_id, comments_disabled, comments_count').eq('id', req.params.postId).single();
     if (!post) return res.status(404).json({ success: false, message: 'Post not found.' });
-    if (post.commentsDisabled) return res.status(403).json({ success: false, message: 'Comments disabled.' });
-    const comment = await Comment.create({ post: post._id, user: req.user._id, text: text.trim(), parent: parentId || null });
-    await Post.findByIdAndUpdate(post._id, { $inc: { commentsCount: 1 } });
-    if (parentId) await Comment.findByIdAndUpdate(parentId, { $push: { replies: comment._id }, $inc: { repliesCount: 1 } });
-    const populated = await comment.populate('user', 'username avatar verified');
-    req.app.get('io').emit('comment_added', { postId: post._id, comment: populated });
-    if (post.user.toString() !== req.user._id.toString()) { const notif = await Notification.create({ recipient: post.user, sender: req.user._id, type: 'comment', post: post._id, message: req.user.username + ' commented: "' + text.slice(0,40) + '"' }); const pop = await notif.populate('sender', 'username avatar'); req.app.get('io').to('user:' + post.user).emit('notification', pop); }
-    res.status(201).json({ success: true, comment: populated });
-} catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    if (post.comments_disabled) return res.status(403).json({ success: false, message: 'Comments are disabled on this post.' });
+
+    const { data: comment, error } = await supabase
+      .from('comments')
+      .insert({ post_id: req.params.postId, user_id: req.user.id, text: text.trim(), parent_id: parentId || null })
+      .select(`*, users!user_id(id, username, full_name, avatar, verified)`)
+      .single();
+
+    if (error) throw error;
+
+    await supabase.from('posts').update({ comments_count: (post.comments_count || 0) + 1 }).eq('id', post.id);
+    if (parentId) {
+      await supabase.from('comments').update({ replies_count: supabase.rpc ? undefined : 1 }).eq('id', parentId);
+      // Simple increment
+      const { data: parent } = await supabase.from('comments').select('replies_count').eq('id', parentId).single();
+      if (parent) await supabase.from('comments').update({ replies_count: (parent.replies_count || 0) + 1 }).eq('id', parentId);
+    }
+
+    const io = req.app.get('io');
+    if (post.user_id !== req.user.id) {
+      await notify(io, { type: 'comment', recipientId: post.user_id, senderId: req.user.id, postId: post.id, message: `${req.user.username} commented: "${text.slice(0, 50)}"` });
+    }
+    io?.emit('comment_added', { postId: req.params.postId, comment });
+
+    res.status(201).json({
+      success: true,
+      comment: {
+        id: comment.id, _id: comment.id,
+        text: comment.text,
+        likesCount: 0,
+        createdAt: comment.created_at,
+        user: { id: req.user.id, username: req.user.username, fullName: req.user.full_name, avatar: req.user.avatar || '', verified: req.user.verified },
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
 });
- 
+
 router_comments.post('/:id/like', protect, async (req, res) => {
   try {
-    const comment = await Comment.findById(req.params.id);
+    const { data: comment } = await supabase.from('comments').select('id, likes_count').eq('id', req.params.id).single();
     if (!comment) return res.status(404).json({ success: false, message: 'Comment not found.' });
-    const liked = comment.likes.some(id => id.toString() === req.user._id.toString());
-    if (liked) { comment.likes.pull(req.user._id); comment.likesCount--; } else { comment.likes.push(req.user._id); comment.likesCount++; }
-    await comment.save();
-    res.json({ success: true, liked: !liked, likesCount: comment.likesCount });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+
+    const { data: existing } = await supabase.from('comment_likes').select('id')
+      .eq('user_id', req.user.id).eq('comment_id', comment.id).maybeSingle();
+
+    let liked, newCount;
+    if (existing) {
+      await supabase.from('comment_likes').delete().eq('user_id', req.user.id).eq('comment_id', comment.id);
+      newCount = Math.max(0, (comment.likes_count || 1) - 1);
+      liked    = false;
+    } else {
+      await supabase.from('comment_likes').insert({ user_id: req.user.id, comment_id: comment.id });
+      newCount = (comment.likes_count || 0) + 1;
+      liked    = true;
+    }
+    await supabase.from('comments').update({ likes_count: newCount }).eq('id', comment.id);
+    res.json({ success: true, liked, likesCount: newCount });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
 });
- 
+
 router_comments.delete('/:id', protect, async (req, res) => {
   try {
-    const comment = await Comment.findById(req.params.id);
+    const { data: comment } = await supabase.from('comments').select('id, user_id, post_id').eq('id', req.params.id).single();
     if (!comment) return res.status(404).json({ success: false, message: 'Comment not found.' });
-    if (comment.user.toString() !== req.user._id.toString()) return res.status(403).json({ success: false, message: 'Not authorized.' });
-    comment.isDeleted = true; await comment.save();
-    await Post.findByIdAndUpdate(comment.post, { $inc: { commentsCount: -1 } });
-    req.app.get('io').emit('comment_deleted', { postId: comment.post, commentId: comment._id });
-    res.json({ success: true });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    if (comment.user_id !== req.user.id) return res.status(403).json({ success: false, message: 'Not authorized.' });
+    await supabase.from('comments').update({ is_deleted: true }).eq('id', comment.id);
+    const { data: post } = await supabase.from('posts').select('comments_count').eq('id', comment.post_id).single();
+    if (post) await supabase.from('posts').update({ comments_count: Math.max(0, (post.comments_count || 1) - 1) }).eq('id', comment.post_id);
+    res.json({ success: true, message: 'Comment deleted.' });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
 });
- 
-// ── MESSAGES ─────────────────────────────────────────────────
+
+// ═══════════════════════════════════════════════════════
+// MESSAGES
+// ═══════════════════════════════════════════════════════
+const router_messages = require('express').Router();
+
 router_messages.get('/conversations', protect, async (req, res) => {
   try {
-    const convs = await Conversation.find({ participants: req.user._id }).populate('participants', 'username fullName avatar verified').sort({ 'lastMessage.ts': -1 });
-    const result = convs.map(c => { const other = c.participants.find(p => p._id.toString() !== req.user._id.toString()); return { id: c._id, isGroup: c.isGroup, groupName: c.groupName, partner: other ? { ...other.toObject(), avatar: other.avatarUrl, isOnline: isUserOnline(other._id) } : null, lastMessage: c.lastMessage, unreadCount: c.unreadCounts?.get(req.user._id.toString()) || 0 }; });
-    res.json({ success: true, conversations: result });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    const { data: convs } = await supabase
+      .from('conversations')
+      .select(`
+        *,
+        conversation_participants!inner(user_id),
+        participants:conversation_participants(user:users(id, username, full_name, avatar, verified, last_seen))
+      `)
+      .eq('conversation_participants.user_id', req.user.id)
+      .order('updated_at', { ascending: false })
+      .limit(30);
+
+    const formatted = (convs || []).map(c => {
+      const partner = c.participants?.find(p => p.user?.id !== req.user.id)?.user;
+      return {
+        id:          c.id,
+        partner:     partner ? { ...formatUser(partner), isOnline: isUserOnline(partner.id) } : null,
+        lastMessage: c.last_message,
+        unreadCount: c.unread_counts?.[req.user.id] || 0,
+        updatedAt:   c.updated_at,
+      };
+    }).filter(c => c.partner);
+
+    res.json({ success: true, conversations: formatted });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
 });
- 
+
 router_messages.post('/conversations', protect, async (req, res) => {
   try {
     const { userId } = req.body;
-    let conv = await Conversation.findOne({ participants: { $all: [req.user._id, userId], $size: 2 }, isGroup: false });
-    if (!conv) conv = await Conversation.create({ participants: [req.user._id, userId] });
-    await conv.populate('participants', 'username fullName avatar verified');
-    res.json({ success: true, conversation: conv });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    if (!userId) return res.status(400).json({ success: false, message: 'userId required.' });
+    if (userId === req.user.id) return res.status(400).json({ success: false, message: "Can't message yourself." });
+
+    const { data: other } = await supabase.from('users').select('id').eq('id', userId).maybeSingle();
+    if (!other) return res.status(404).json({ success: false, message: 'User not found.' });
+
+    // Check for existing direct conversation
+    const { data: existing } = await supabase.rpc('find_direct_conversation', {
+      user_a: req.user.id,
+      user_b: userId,
+    });
+
+    if (existing?.[0]) {
+      return res.json({ success: true, conversation: { id: existing[0].id } });
+    }
+
+    // Create new conversation + add participants
+    const { data: conv } = await supabase.from('conversations').insert({ is_group: false }).select().single();
+    await supabase.from('conversation_participants').insert([
+      { conversation_id: conv.id, user_id: req.user.id },
+      { conversation_id: conv.id, user_id: userId },
+    ]);
+
+    res.json({ success: true, conversation: { id: conv.id } });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
 });
- 
+
 router_messages.get('/:conversationId', protect, async (req, res) => {
   try {
-    const { page = 1, limit = 30 } = req.query;
-    const msgs = await Message.find({ conversation: req.params.conversationId, isDeleted: false }).populate('sender', 'username avatar verified').sort({ createdAt: -1 }).skip((page-1)*limit).limit(+limit);
-    await Conversation.findByIdAndUpdate(req.params.conversationId, { $set: { ['unreadCounts.' + req.user._id]: 0 } });
-    res.json({ success: true, messages: msgs.reverse(), page: +page });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    // Verify participant
+    const { data: participant } = await supabase
+      .from('conversation_participants')
+      .select('user_id')
+      .eq('conversation_id', req.params.conversationId)
+      .eq('user_id', req.user.id)
+      .maybeSingle();
+
+    if (!participant) return res.status(404).json({ success: false, message: 'Conversation not found.' });
+
+    const limit  = Math.min(50, parseInt(req.query.limit) || 30);
+    const { data: messages } = await supabase
+      .from('messages')
+      .select(`*, sender:users!sender_id(id, username, full_name, avatar)`)
+      .eq('conversation_id', req.params.conversationId)
+      .eq('is_deleted', false)
+      .order('created_at', { ascending: false })
+      .limit(limit);
+
+    // Mark as read — update unread_counts
+    const { data: conv } = await supabase.from('conversations').select('unread_counts').eq('id', req.params.conversationId).single();
+    if (conv) {
+      const counts = conv.unread_counts || {};
+      counts[req.user.id] = 0;
+      await supabase.from('conversations').update({ unread_counts: counts }).eq('id', req.params.conversationId);
+    }
+
+    res.json({ success: true, messages: (messages || []).reverse() });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
 });
- 
-router_messages.post('/:conversationId', protect, upload.single('media'), handlePostUpload, async (req, res) => {
+
+router_messages.post('/:conversationId', protect, async (req, res) => {
   try {
-    const { text, type = 'text', replyTo } = req.body;
-    const conv = await Conversation.findById(req.params.conversationId);
-    if (!conv) return res.status(404).json({ success: false, message: 'Conversation not found.' });
-    const media = req.processedMedia?.[0];
-    const msg = await Message.create({ conversation: conv._id, sender: req.user._id, type, text: text?.trim(), media, replyTo, deliveredTo: conv.participants.filter(p => p.toString() !== req.user._id.toString()) });
-    const updates = { lastMessage: { text: text || (media ? '📷 Media' : ''), type, senderId: req.user._id, ts: new Date() } };
-    conv.participants.forEach(pid => { if (pid.toString() !== req.user._id.toString()) updates['unreadCounts.' + pid] = (conv.unreadCounts?.get(pid.toString()) || 0) + 1; });
-    await Conversation.findByIdAndUpdate(conv._id, { $set: updates });
-    const populated = await msg.populate('sender', 'username avatar verified');
+    const { data: participant } = await supabase
+      .from('conversation_participants')
+      .select('user_id')
+      .eq('conversation_id', req.params.conversationId)
+      .eq('user_id', req.user.id)
+      .maybeSingle();
+    if (!participant) return res.status(404).json({ success: false, message: 'Conversation not found.' });
+
+    const { text, type = 'text' } = req.body;
+    if (!text?.trim()) return res.status(400).json({ success: false, message: 'Message text required.' });
+
+    const { data: message } = await supabase
+      .from('messages')
+      .insert({ conversation_id: req.params.conversationId, sender_id: req.user.id, type, text: text.trim() })
+      .select(`*, sender:users!sender_id(id, username, full_name, avatar)`)
+      .single();
+
+    // Update conversation last_message + unread counts
+    const { data: conv } = await supabase.from('conversations').select('unread_counts').eq('id', req.params.conversationId).single();
+    const { data: allParticipants } = await supabase.from('conversation_participants').select('user_id').eq('conversation_id', req.params.conversationId);
+    const counts = conv?.unread_counts || {};
+    (allParticipants || []).forEach(p => {
+      if (p.user_id !== req.user.id) counts[p.user_id] = (counts[p.user_id] || 0) + 1;
+    });
+    await supabase.from('conversations').update({
+      last_message: { text: text.trim(), type, sender_id: req.user.id, ts: new Date().toISOString() },
+      unread_counts: counts,
+      updated_at: new Date().toISOString(),
+    }).eq('id', req.params.conversationId);
+
+    // Socket emit
     const io = req.app.get('io');
-    io.to('conv:' + conv._id).emit('new_message', { conversationId: conv._id, message: populated });
-    conv.participants.forEach(pid => { if (pid.toString() !== req.user._id.toString()) io.to('user:' + pid).emit('dm_notification', { conversationId: conv._id, from: { id: req.user._id, username: req.user.username, avatar: req.user.avatarUrl }, preview: text || '📷 Media', ts: Date.now() }); });
-    res.status(201).json({ success: true, message: populated });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    io?.to('conv:' + req.params.conversationId).emit('new_message', { conversationId: req.params.conversationId, message });
+
+    const recipient = (allParticipants || []).find(p => p.user_id !== req.user.id);
+    if (recipient) {
+      io?.to('user:' + recipient.user_id).emit('dm_notification', {
+        conversationId: req.params.conversationId,
+        from:    { id: req.user.id, username: req.user.username, avatar: req.user.avatar },
+        preview: text.slice(0, 50),
+      });
+    }
+
+    res.status(201).json({ success: true, message });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
 });
- 
-// ── STORIES ──────────────────────────────────────────────────
+
+// ═══════════════════════════════════════════════════════
+// STORIES
+// ═══════════════════════════════════════════════════════
+const router_stories = require('express').Router();
+
 router_stories.get('/feed', protect, async (req, res) => {
   try {
-    const me = await User.findById(req.user._id).select('following');
-    const ids = [...(me.following||[]), req.user._id];
-    const stories = await Story.find({ user: { $in: ids }, isDeleted: false, expiresAt: { $gt: new Date() } }).populate('user', 'username avatar verified').sort({ createdAt: -1 });
+    const { data: follows } = await supabase.from('follows').select('following_id').eq('follower_id', req.user.id);
+    const userIds = [(follows || []).map(f => f.following_id), req.user.id].flat();
+
+    const { data: stories } = await supabase
+      .from('stories')
+      .select(`*, users!user_id(id, username, full_name, avatar, verified)`)
+      .in('user_id', userIds)
+      .eq('is_deleted', false)
+      .gt('expires_at', new Date().toISOString())
+      .order('created_at', { ascending: false });
+
+    // Group by user
     const grouped = {};
-    stories.forEach(s => { const uid = s.user._id.toString(); if (!grouped[uid]) grouped[uid] = { user: s.user, stories: [], hasUnread: false }; const seen = s.viewers?.some(v => v.user?.toString() === req.user._id.toString()); grouped[uid].stories.push({ ...s.toObject(), seen }); if (!seen) grouped[uid].hasUnread = true; });
+    (stories || []).forEach(s => {
+      const uid = s.user_id;
+      if (!grouped[uid]) grouped[uid] = { user: s.users, stories: [], hasUnread: false };
+      grouped[uid].stories.push(s);
+      const viewed = s.viewers?.some(v => v.user_id === req.user.id);
+      if (!viewed) grouped[uid].hasUnread = true;
+    });
+
     res.json({ success: true, storyGroups: Object.values(grouped) });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
 });
- 
+
 router_stories.post('/', protect, upload.single('media'), handleStoryUpload, async (req, res) => {
   try {
-    if (!req.storyFilename) return res.status(400).json({ success: false, message: 'Media required.' });
-    const { text, location, audience } = req.body;
-    const story = await Story.create({ user: req.user._id, media: { url: req.storyFilename, type: req.storyIsVideo ? 'video' : 'image' }, text, location, audience: audience || 'all' });
-    await User.findByIdAndUpdate(req.user._id, { $inc: { storiesCount: 1 } });
-    const populated = await story.populate('user', 'username avatar verified');
-    const fullUser = await User.findById(req.user._id).select('followers');
-    fullUser.followers.forEach(fid => req.app.get('io').to('user:' + fid).emit('new_story', populated));
-    res.status(201).json({ success: true, story: populated });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    if (!req.storyMedia) return res.status(400).json({ success: false, message: 'Media required for story.' });
+
+    const { data: story } = await supabase
+      .from('stories')
+      .insert({
+        user_id:    req.user.id,
+        media:      req.storyMedia,
+        text:       req.body.text     || '',
+        location:   req.body.location || '',
+        audience:   req.body.audience || 'all',
+        expires_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+      })
+      .select(`*, users!user_id(id, username, full_name, avatar, verified)`)
+      .single();
+
+    const io = req.app.get('io');
+    const { data: follows } = await supabase.from('follows').select('follower_id').eq('following_id', req.user.id);
+    (follows || []).forEach(f => io?.to('user:' + f.follower_id).emit('new_story', story));
+
+    res.status(201).json({ success: true, story });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
 });
- 
+
 router_stories.post('/:id/view', protect, async (req, res) => {
   try {
-    const story = await Story.findById(req.params.id);
+    const { data: story } = await supabase.from('stories').select('id, viewers, viewers_count, user_id').eq('id', req.params.id).single();
     if (!story) return res.status(404).json({ success: false, message: 'Story not found.' });
-    const alreadyViewed = story.viewers?.some(v => v.user?.toString() === req.user._id.toString());
-    if (!alreadyViewed) { story.viewers.push({ user: req.user._id, viewedAt: new Date() }); story.viewersCount++; await story.save(); req.app.get('io').to('user:' + story.user).emit('story_viewed', { storyId: story._id, viewedBy: { id: req.user._id, username: req.user.username, avatar: req.user.avatarUrl } }); }
+
+    const viewers    = story.viewers || [];
+    const alreadySeen = viewers.some(v => v.user_id === req.user.id);
+    if (!alreadySeen) {
+      viewers.push({ user_id: req.user.id, viewed_at: new Date().toISOString() });
+      await supabase.from('stories').update({ viewers, viewers_count: (story.viewers_count || 0) + 1 }).eq('id', story.id);
+      req.app.get('io')?.to('user:' + story.user_id).emit('story_viewed', {
+        storyId:  story.id,
+        viewedBy: { id: req.user.id, username: req.user.username, avatar: req.user.avatar },
+      });
+    }
     res.json({ success: true });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
 });
- 
-// ── NOTIFICATIONS ─────────────────────────────────────────────
+
+router_stories.delete('/:id', protect, async (req, res) => {
+  try {
+    const { data: story } = await supabase.from('stories').select('id, user_id').eq('id', req.params.id).single();
+    if (!story) return res.status(404).json({ success: false, message: 'Story not found.' });
+    if (story.user_id !== req.user.id) return res.status(403).json({ success: false, message: 'Not authorized.' });
+    await supabase.from('stories').update({ is_deleted: true }).eq('id', story.id);
+    res.json({ success: true, message: 'Story deleted.' });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════
+// NOTIFICATIONS
+// ═══════════════════════════════════════════════════════
+const router_notifs = require('express').Router();
+
 router_notifs.get('/', protect, async (req, res) => {
   try {
-    const { page = 1, limit = 30 } = req.query;
-    const notifs = await Notification.find({ recipient: req.user._id }).populate('sender', 'username avatar verified').populate('post', 'media').sort({ createdAt: -1 }).skip((page-1)*limit).limit(+limit);
-    const unreadCount = await Notification.countDocuments({ recipient: req.user._id, isRead: false });
-    res.json({ success: true, notifications: notifs, unreadCount });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    const limit = Math.min(50, parseInt(req.query.limit) || 30);
+    const { data: notifs } = await supabase
+      .from('notifications')
+      .select(`*, sender:users!sender_id(id, username, full_name, avatar, verified), post:posts!post_id(id, media, caption)`)
+      .eq('recipient_id', req.user.id)
+      .order('created_at', { ascending: false })
+      .limit(limit);
+
+    // Mark all as read
+    await supabase.from('notifications').update({ is_read: true, read_at: new Date().toISOString() })
+      .eq('recipient_id', req.user.id).eq('is_read', false);
+
+    res.json({ success: true, notifications: (notifs || []).map(n => ({
+      id:        n.id,
+      _id:       n.id,
+      type:      n.type,
+      message:   n.message,
+      isRead:    n.is_read,
+      createdAt: n.created_at,
+      sender:    n.sender ? { ...n.sender, avatar: n.sender.avatar || `https://ui-avatars.com/api/?name=${encodeURIComponent(n.sender.full_name || 'U')}&background=0095f6&color=fff` } : null,
+      post:      n.post || null,
+    })) });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
 });
- 
-router_notifs.put('/read-all', protect, async (req, res) => {
+
+router_notifs.get('/unread-count', protect, async (req, res) => {
   try {
-    await Notification.updateMany({ recipient: req.user._id, isRead: false }, { isRead: true, readAt: new Date() });
-    res.json({ success: true });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    const { count } = await supabase.from('notifications').select('*', { count: 'exact', head: true })
+      .eq('recipient_id', req.user.id).eq('is_read', false);
+    res.json({ success: true, count: count || 0 });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
 });
- 
-// ── SEARCH ───────────────────────────────────────────────────
+
+// ═══════════════════════════════════════════════════════
+// SEARCH
+// ═══════════════════════════════════════════════════════
+const router_search = require('express').Router();
+
 router_search.get('/', optionalAuth, async (req, res) => {
   try {
-    const { q, type = 'all' } = req.query;
-    if (!q?.trim()) return res.json({ success: true, users: [], posts: [], hashtags: [] });
-    const results = {};
-    if (type === 'all' || type === 'users') { results.users = await User.find({ $or: [{ username: { $regex: q, $options: 'i' } }, { fullName: { $regex: q, $options: 'i' } }], isActive: true }).select('username fullName avatar verified bio followersCount').limit(10); results.users = results.users.map(u => ({ ...u.toObject(), avatar: u.avatarUrl })); }
-    if (type === 'all' || type === 'posts') { results.posts = await Post.find({ caption: { $regex: q, $options: 'i' }, isDeleted: false }).populate('user', 'username avatar verified').sort({ engagementScore: -1 }).limit(20); results.posts = results.posts.map(p => ({ ...p.toObject(), media: p.mediaUrls })); }
-    res.json({ success: true, ...results });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    const q = (req.query.q || '').trim();
+    if (!q) return res.json({ success: true, users: [], posts: [] });
+
+    const [{ data: users }, { data: posts }] = await Promise.all([
+      supabase.from('users').select('id, username, full_name, avatar, verified, bio, followers_count')
+        .or(`username.ilike.%${q}%,full_name.ilike.%${q}%`)
+        .eq('is_active', true).limit(10),
+
+      supabase.from('posts').select(`*, users!user_id(id, username, full_name, avatar, verified)`)
+        .or(`caption.ilike.%${q}%,location.ilike.%${q}%`)
+        .eq('is_deleted', false).order('likes_count', { ascending: false }).limit(15),
+    ]);
+
+    res.json({
+      success: true,
+      users:   (users || []).map(u => formatUser(u)),
+      posts:   (posts || []).map(p => formatPost(p)),
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
 });
- 
-// ── EXPLORE ──────────────────────────────────────────────────
+
+// ═══════════════════════════════════════════════════════
+// EXPLORE
+// ═══════════════════════════════════════════════════════
+const router_explore = require('express').Router();
+
 router_explore.get('/', optionalAuth, async (req, res) => {
   try {
-    const { page = 1, limit = 30 } = req.query;
-    const exclude = req.user ? (await User.findById(req.user._id).select('following')).following : [];
-    const posts = await Post.find({ user: req.user ? { $nin: [...exclude, req.user._id] } : {}, isDeleted: false, 'media.0': { $exists: true } }).populate('user', 'username avatar verified').sort({ engagementScore: -1, createdAt: -1 }).skip((page-1)*limit).limit(+limit);
-    res.json({ success: true, posts: posts.map(p => ({ ...p.toObject(), media: p.mediaUrls })) });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    const page   = Math.max(1, parseInt(req.query.page) || 1);
+    const limit  = Math.min(30, parseInt(req.query.limit) || 30);
+    const offset = (page - 1) * limit;
+
+    let excludeIds = [];
+    if (req.user) {
+      const { data: follows } = await supabase.from('follows').select('following_id').eq('follower_id', req.user.id);
+      excludeIds = (follows || []).map(f => f.following_id);
+      excludeIds.push(req.user.id);
+    }
+
+    let query = supabase
+      .from('posts')
+      .select(`*, users!user_id(id, username, full_name, avatar, verified)`)
+      .in('type', ['post', 'reel'])
+      .eq('is_deleted', false)
+      .order('likes_count', { ascending: false })
+      .range(offset, offset + limit - 1);
+
+    if (excludeIds.length) {
+      query = query.not('user_id', 'in', `(${excludeIds.join(',')})`);
+    }
+
+    const { data: posts } = await query;
+    res.json({ success: true, posts: (posts || []).map(p => formatPost(p)) });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
 });
- 
-// ── REELS ────────────────────────────────────────────────────
+
+// ═══════════════════════════════════════════════════════
+// REELS
+// ═══════════════════════════════════════════════════════
+const router_reels = require('express').Router();
+
 router_reels.get('/', optionalAuth, async (req, res) => {
   try {
-    const { page = 1, limit = 10, cursor } = req.query;
-    const query = { type: 'reel', isDeleted: false };
-    if (cursor) query._id = { $lt: cursor };
-    const reels = await Post.find(query).populate('user', 'username fullName avatar verified bio followersCount').sort({ createdAt: -1 }).limit(+limit);
-    res.json({ success: true, reels: reels.map(r => ({ ...r.toObject(), media: r.mediaUrls, isLiked: req.user ? r.isLikedBy(req.user._id) : false })), nextCursor: reels[reels.length-1]?._id });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    const limit = Math.min(20, parseInt(req.query.limit) || 10);
+    const { data: reels } = await supabase
+      .from('posts')
+      .select(`*, users!user_id(id, username, full_name, avatar, verified, bio, followers_count)`)
+      .eq('type', 'reel')
+      .eq('is_deleted', false)
+      .order('likes_count', { ascending: false })
+      .limit(limit);
+
+    let likedSet = new Set();
+    if (req.user && reels?.length) {
+      const { data: liked } = await supabase.from('likes').select('post_id')
+        .eq('user_id', req.user.id).in('post_id', reels.map(r => r.id));
+      likedSet = new Set((liked || []).map(l => l.post_id));
+    }
+
+    res.json({
+      success: true,
+      reels: (reels || []).map(r => formatPost({ ...r, isLiked: likedSet.has(r.id) })),
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
 });
- 
+
 router_reels.post('/:id/view', optionalAuth, async (req, res) => {
-  try { await Post.findByIdAndUpdate(req.params.id, { $inc: { viewsCount: 1 } }); res.json({ success: true }); }
-  catch (e) { res.status(500).json({ success: false, message: e.message }); }
+  try {
+    const { data: post } = await supabase.from('posts').select('id, views_count').eq('id', req.params.id).single();
+    if (post) await supabase.from('posts').update({ views_count: (post.views_count || 0) + 1 }).eq('id', post.id);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
 });
- 
-// ── GROUPS ───────────────────────────────────────────────────
+
+// ═══════════════════════════════════════════════════════
+// GROUPS
+// ═══════════════════════════════════════════════════════
+const router_groups = require('express').Router();
+
 router_groups.get('/', optionalAuth, async (req, res) => {
   try {
-    const { page = 1, limit = 12 } = req.query;
-    const groups = await Group.find({ isActive: true, privacy: { $ne: 'secret' } }).populate('admin', 'username avatar').sort({ membersCount: -1 }).skip((page-1)*limit).limit(+limit);
-    res.json({ success: true, groups: groups.map(g => ({ ...g.toObject(), isMember: req.user ? g.members.some(m => m.toString() === req.user._id.toString()) : false })) });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    const page   = Math.max(1, parseInt(req.query.page) || 1);
+    const limit  = Math.min(20, parseInt(req.query.limit) || 12);
+    const offset = (page - 1) * limit;
+
+    const { data: groups } = await supabase
+      .from('groups')
+      .select(`*, admin:users!admin_id(id, username, avatar)`)
+      .eq('is_active', true)
+      .neq('privacy', 'secret')
+      .order('members_count', { ascending: false })
+      .range(offset, offset + limit - 1);
+
+    let memberGroupIds = new Set();
+    if (req.user) {
+      const { data: memberships } = await supabase.from('group_members').select('group_id').eq('user_id', req.user.id);
+      memberGroupIds = new Set((memberships || []).map(m => m.group_id));
+    }
+
+    res.json({
+      success: true,
+      groups: (groups || []).map(g => ({
+        ...g,
+        isMember: memberGroupIds.has(g.id),
+      })),
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
 });
- 
-router_groups.post('/:id/join', protect, async (req, res) => {
-  try {
-    const group = await Group.findById(req.params.id);
-    if (!group) return res.status(404).json({ success: false, message: 'Group not found.' });
-    const isMember = group.members.some(m => m.toString() === req.user._id.toString());
-    if (isMember) { group.members.pull(req.user._id); group.membersCount = Math.max(0, group.membersCount-1); }
-    else { if (group.privacy === 'private') { group.pendingMembers.push(req.user._id); await group.save(); return res.json({ success: true, status: 'pending' }); } group.members.push(req.user._id); group.membersCount++; }
-    await group.save();
-    res.json({ success: true, joined: !isMember, membersCount: group.membersCount });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
-});
- 
+
 router_groups.post('/', protect, async (req, res) => {
   try {
-    const { name, description, privacy, category } = req.body;
-    const group = await Group.create({ name, description, privacy, category, admin: req.user._id, members: [req.user._id], membersCount: 1 });
+    const { name, description, privacy = 'public', category } = req.body;
+    if (!name?.trim()) return res.status(400).json({ success: false, message: 'Group name required.' });
+
+    const { data: group } = await supabase
+      .from('groups')
+      .insert({ name: name.trim(), description: description?.trim() || '', privacy, category: category || '', admin_id: req.user.id, members_count: 1 })
+      .select().single();
+
+    // Add creator as member
+    await supabase.from('group_members').insert({ group_id: group.id, user_id: req.user.id, role: 'admin' });
+
     res.status(201).json({ success: true, group });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
-});
- // Handle follow requests
-router_users.post('/:id/follow-request/:action', protect, async (req, res) => {
-  try {
-    const { action } = req.params; // 'accept' or 'reject'
-    const targetUser = await User.findById(req.user._id);
-    const requestingUser = await User.findById(req.params.id);
-    
-    if (!targetUser || !requestingUser) {
-      return res.status(404).json({ success: false, message: 'User not found' });
-    }
-    
-    // Remove from follow requests
-    targetUser.followRequests.pull(requestingUser._id);
-    
-    if (action === 'accept') {
-      // Add to followers
-      targetUser.followers.push(requestingUser._id);
-      requestingUser.following.push(targetUser._id);
-      targetUser.followersCount++;
-      requestingUser.followingCount++;
-      
-      // Send acceptance notification
-      const notification = await Notification.create({
-        recipient: requestingUser._id,
-        sender: targetUser._id,
-        type: 'follow_request_accepted',
-        message: `${targetUser.username} accepted your follow request`
-      });
-      const io = req.app.get('io');
-      const populatedNotif = await notification.populate('sender', 'username avatar');
-      io.to('user:' + requestingUser._id).emit('notification', populatedNotif);
-    }
-    
-    await Promise.all([
-      targetUser.save({ validateBeforeSave: false }),
-      requestingUser.save({ validateBeforeSave: false })
-    ]);
-    
-    res.json({ 
-      success: true, 
-      message: `Follow request ${action}ed` 
-    });
-  } catch (e) {
-    res.status(500).json({ success: false, message: e.message });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
   }
 });
 
-// Block/Unblock users
-router_users.post('/:id/block', protect, async (req, res) => {
+router_groups.post('/:id/join', protect, async (req, res) => {
   try {
-    const targetUserId = req.params.id;
-    const currentUser = await User.findById(req.user._id);
-    
-    if (targetUserId === req.user._id.toString()) {
-      return res.status(400).json({ success: false, message: "Can't block yourself" });
+    const { data: group } = await supabase.from('groups').select('*').eq('id', req.params.id).single();
+    if (!group) return res.status(404).json({ success: false, message: 'Group not found.' });
+
+    const { data: member } = await supabase.from('group_members').select('id')
+      .eq('group_id', group.id).eq('user_id', req.user.id).maybeSingle();
+
+    if (member) {
+      // Leave group
+      await supabase.from('group_members').delete().eq('group_id', group.id).eq('user_id', req.user.id);
+      await supabase.from('groups').update({ members_count: Math.max(0, (group.members_count || 1) - 1) }).eq('id', group.id);
+      return res.json({ success: true, joined: false, membersCount: Math.max(0, (group.members_count || 1) - 1) });
     }
-    
-    const isBlocked = currentUser.blockedUsers.includes(targetUserId);
-    
-    if (isBlocked) {
-      // Unblock
-      currentUser.blockedUsers.pull(targetUserId);
-    } else {
-      // Block
-      currentUser.blockedUsers.push(targetUserId);
-      // Also unfollow each other
-      currentUser.following.pull(targetUserId);
-      await User.findByIdAndUpdate(targetUserId, {
-        $pull: { followers: currentUser._id }
-      });
+
+    if (group.privacy === 'private') {
+      // Pending request
+      await supabase.from('group_members').insert({ group_id: group.id, user_id: req.user.id, role: 'pending' });
+      return res.json({ success: true, status: 'pending', message: 'Join request sent' });
     }
-    
-    await currentUser.save({ validateBeforeSave: false });
-    
-    res.json({
-      success: true,
-      blocked: !isBlocked,
-      message: isBlocked ? 'User unblocked' : 'User blocked'
-    });
-  } catch (e) {
-    res.status(500).json({ success: false, message: e.message });
+
+    await supabase.from('group_members').insert({ group_id: group.id, user_id: req.user.id, role: 'member' });
+    const newCount = (group.members_count || 0) + 1;
+    await supabase.from('groups').update({ members_count: newCount }).eq('id', group.id);
+    res.json({ success: true, joined: true, membersCount: newCount });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
   }
 });
 
-// Close Friends management
-router_users.post('/close-friends/:id', protect, async (req, res) => {
-  try {
-    const targetUserId = req.params.id;
-    const currentUser = await User.findById(req.user._id);
-    
-    const isCloseFriend = currentUser.closeFriends.includes(targetUserId);
-    
-    if (isCloseFriend) {
-      currentUser.closeFriends.pull(targetUserId);
-    } else {
-      currentUser.closeFriends.push(targetUserId);
-    }
-    
-    await currentUser.save({ validateBeforeSave: false });
-    
-    res.json({
-      success: true,
-      isCloseFriend: !isClosedFriend,
-      message: isCloseFriend ? 'Removed from close friends' : 'Added to close friends'
-    });
-  } catch (e) {
-    res.status(500).json({ success: false, message: e.message });
-  }
-});
-
-// Privacy settings update
-router_users.put('/privacy-settings', protect, async (req, res) => {
-  try {
-    const { profileVisibility, storyVisibility, messagePermissions } = req.body;
-    const user = await User.findByIdAndUpdate(
-      req.user._id,
-      {
-        privacySettings: {
-          profileVisibility: profileVisibility || 'public',
-          storyVisibility: storyVisibility || 'public',
-          messagePermissions: messagePermissions || 'everyone'
-        }
-      },
-      { new: true }
-    );
-    
-    res.json({
-      success: true,
-      privacySettings: user.privacySettings
-    });
-  } catch (e) {
-    res.status(500).json({ success: false, message: e.message });
-  }
-});
-
-module.exports = { userRoutes: router_users, commentRoutes: router_comments, messageRoutes: router_messages, storyRoutes: router_stories, notifRoutes: router_notifs, searchRoutes: router_search, exploreRoutes: router_explore, reelRoutes: router_reels, groupRoutes: router_groups };
+module.exports = {
+  userRoutes:    require('./users'),
+  commentRoutes: router_comments,
+  messageRoutes: router_messages,
+  storyRoutes:   router_stories,
+  notifRoutes:   router_notifs,
+  searchRoutes:  router_search,
+  exploreRoutes: router_explore,
+  reelRoutes:    router_reels,
+  groupRoutes:   router_groups,
+};
