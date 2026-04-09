@@ -247,40 +247,91 @@ router_messages.post('/:conversationId', protect, async (req, res) => {
     const { text, type = 'text' } = req.body;
     if (!text?.trim()) return res.status(400).json({ success: false, message: 'Message text required.' });
 
-    const { data: message } = await supabase
+    // Save message to Supabase
+    const { data: message, error } = await supabase
       .from('messages')
-      .insert({ conversation_id: req.params.conversationId, sender_id: req.user.id, type, text: text.trim() })
-      .select(`*, sender:users!sender_id(id, username, full_name, avatar)`)
+      .insert({
+        conversation_id: req.params.conversationId,
+        sender_id: req.user.id,
+        type,
+        text: text.trim(),
+      })
+      .select(`
+        id, conversation_id, type, text, is_deleted, created_at,
+        sender:users!sender_id(id, username, full_name, avatar)
+      `)
       .single();
 
+    if (error) throw error;
+
+    // Format message for frontend (match what frontend expects)
+    const formatted = {
+      id:             message.id,
+      _id:            message.id,
+      conversationId: message.conversation_id,
+      type:           message.type,
+      text:           message.text,
+      createdAt:      message.created_at,
+      sender: {
+        id:       message.sender?.id,
+        _id:      message.sender?.id,
+        username: message.sender?.username,
+        fullName: message.sender?.full_name,
+        avatar:   message.sender?.avatar || '',
+      },
+    };
+
     // Update conversation last_message + unread counts
-    const { data: conv } = await supabase.from('conversations').select('unread_counts').eq('id', req.params.conversationId).single();
-    const { data: allParticipants } = await supabase.from('conversation_participants').select('user_id').eq('conversation_id', req.params.conversationId);
+    const { data: allParticipants } = await supabase
+      .from('conversation_participants')
+      .select('user_id')
+      .eq('conversation_id', req.params.conversationId);
+
+    const { data: conv } = await supabase
+      .from('conversations')
+      .select('unread_counts')
+      .eq('id', req.params.conversationId)
+      .single();
+
     const counts = conv?.unread_counts || {};
     (allParticipants || []).forEach(p => {
-      if (p.user_id !== req.user.id) counts[p.user_id] = (counts[p.user_id] || 0) + 1;
+      if (p.user_id !== req.user.id) {
+        counts[p.user_id] = (counts[p.user_id] || 0) + 1;
+      }
     });
+
     await supabase.from('conversations').update({
-      last_message: { text: text.trim(), type, sender_id: req.user.id, ts: new Date().toISOString() },
+      last_message:  { text: text.trim(), type, sender_id: req.user.id, ts: new Date().toISOString() },
       unread_counts: counts,
-      updated_at: new Date().toISOString(),
+      updated_at:    new Date().toISOString(),
     }).eq('id', req.params.conversationId);
 
-    // Socket emit
-    const io = req.app.get('io');
-    io?.to('conv:' + req.params.conversationId).emit('new_message', { conversationId: req.params.conversationId, message });
-
+    // ✅ FIX: Only emit to RECIPIENT — NOT to the full conversation room
+    // The sender already has the message from the HTTP response
+    // Emitting to 'conv:id' sends to everyone including sender = duplicate
+    const io        = req.app.get('io');
     const recipient = (allParticipants || []).find(p => p.user_id !== req.user.id);
+
     if (recipient) {
+      // Send full message to recipient's user room so they receive it
+      io?.to('user:' + recipient.user_id).emit('new_message', {
+        conversationId: req.params.conversationId,
+        message:        formatted,
+      });
+
+      // Also send DM notification (badge + toast)
       io?.to('user:' + recipient.user_id).emit('dm_notification', {
         conversationId: req.params.conversationId,
-        from:    { id: req.user.id, username: req.user.username, avatar: req.user.avatar },
-        preview: text.slice(0, 50),
+        from:    { id: req.user.id, username: req.user.username, avatar: req.user.avatar || '' },
+        preview: text.trim().slice(0, 50),
+        ts:      Date.now(),
       });
     }
 
-    res.status(201).json({ success: true, message });
+    // Return message to sender via HTTP — sender appends it to UI themselves
+    res.status(201).json({ success: true, message: formatted });
   } catch (err) {
+    console.error('Send message error:', err);
     res.status(500).json({ success: false, message: err.message });
   }
 });
