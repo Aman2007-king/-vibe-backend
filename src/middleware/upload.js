@@ -1,108 +1,94 @@
-const multer = require('multer');
-const path = require('path');
-const fs = require('fs');
-const { v4: uuid } = require('uuid');
+const multer   = require('multer');
+const path     = require('path');
+const { v4: uuidv4 } = require('uuid');
+const supabase = require('../db/supabase');
 
-const UPLOAD_DIR = path.join(__dirname, '../../uploads');
-const SUB_DIRS = ['avatars', 'posts', 'stories', 'reels', 'thumbnails', 'messages'];
+const BUCKET = 'media'; // your Supabase Storage bucket name
 
-// Ensure upload directories exist
-SUB_DIRS.forEach(dir => {
-  const p = path.join(UPLOAD_DIR, dir);
-  if (!fs.existsSync(p)) {
-    fs.mkdirSync(p, { recursive: true });
-  }
-});
-
-// Multer storage configuration
+// Memory storage — files go to RAM, then straight to Supabase
 const storage = multer.memoryStorage();
 
-// File filter for uploads
 const fileFilter = (req, file, cb) => {
-  const allowedTypes = /jpeg|jpg|png|gif|webp|mp4|mov|avi|webm|heic/;
-  const ext = path.extname(file.originalname).toLowerCase().replace('.', '');
-  const isValidExt = allowedTypes.test(ext);
-  const isValidMime = allowedTypes.test(file.mimetype);
-  
-  if (isValidExt || isValidMime) {
-    cb(null, true);
-  } else {
-    cb(new Error('File type not supported. Allowed types: jpeg, jpg, png, gif, webp, mp4, mov, avi, webm, heic'));
-  }
+  const allowed = /jpeg|jpg|png|gif|webp|mp4|mov|webm/;
+  const ext  = allowed.test(path.extname(file.originalname).toLowerCase());
+  const mime = file.mimetype.startsWith('image/') || file.mimetype.startsWith('video/');
+  if (ext && mime) cb(null, true);
+  else cb(new Error('Only images and videos are allowed.'));
 };
 
-// Main upload middleware
-const upload = multer({ 
-  storage, 
-  fileFilter, 
-  limits: { fileSize: 50 * 1024 * 1024 } // 50MB limit
+const upload = multer({
+  storage,
+  fileFilter,
+  limits: { fileSize: 100 * 1024 * 1024 }, // 100MB
 });
 
-// Handle post media uploads
-const handlePostUpload = async (req, res, next) => {
-  if (!req.files && !req.file) return next();
-  
-  try {
-    const files = req.files || (req.file ? [req.file] : []);
-    const processed = [];
-    
-    for (const file of files) {
-      const isVideo = file.mimetype.startsWith('video/');
-      const filename = uuid() + (isVideo ? '.mp4' : '.jpg');
-      const filepath = path.join(UPLOAD_DIR, 'posts', filename);
-      
-      fs.writeFileSync(filepath, file.buffer);
-      processed.push({ 
-        url: filename, 
-        type: isVideo ? 'video' : 'image', 
-        size: file.size 
-      });
-    }
-    
-    req.processedMedia = processed;
-    next();
-  } catch (err) {
-    next(new Error('Failed to process uploaded media: ' + err.message));
-  }
-};
+// Upload a buffer to Supabase Storage and return the public URL
+async function uploadToSupabase(buffer, mimetype, folder = 'posts') {
+  const ext  = mimetype.split('/')[1].replace('jpeg', 'jpg');
+  const name = `${folder}/${Date.now()}_${uuidv4()}.${ext}`;
 
-// Handle avatar uploads
+  const { error } = await supabase.storage
+    .from(BUCKET)
+    .upload(name, buffer, { contentType: mimetype, upsert: false });
+
+  if (error) throw new Error('Storage upload failed: ' + error.message);
+
+  const { data } = supabase.storage.from(BUCKET).getPublicUrl(name);
+  return { url: data.publicUrl, path: name };
+}
+
+// Delete file from Supabase Storage by path
+async function deleteFromSupabase(filePath) {
+  if (!filePath) return;
+  await supabase.storage.from(BUCKET).remove([filePath]);
+}
+
+// Middleware: upload single avatar → req.avatarUrl, req.avatarPath
 const handleAvatarUpload = async (req, res, next) => {
   if (!req.file) return next();
-  
   try {
-    const filename = uuid() + '.jpg';
-    const filepath = path.join(UPLOAD_DIR, 'avatars', filename);
-    
-    fs.writeFileSync(filepath, req.file.buffer);
-    req.avatarFilename = filename;
+    const result    = await uploadToSupabase(req.file.buffer, req.file.mimetype, 'avatars');
+    req.avatarUrl   = result.url;
+    req.avatarPath  = result.path;
     next();
   } catch (err) {
-    next(new Error('Failed to process avatar upload: ' + err.message));
+    next(err);
   }
 };
 
-// Handle story uploads
+// Middleware: upload multiple post files → req.processedMedia[]
+const handlePostUpload = async (req, res, next) => {
+  const files = req.files || (req.file ? [req.file] : []);
+  if (!files.length) return next();
+  try {
+    const results = await Promise.all(
+      files.map(f => uploadToSupabase(f.buffer, f.mimetype, 'posts'))
+    );
+    req.processedMedia = results.map((r, i) => ({
+      url:  r.url,
+      path: r.path,
+      type: files[i].mimetype.startsWith('video/') ? 'video' : 'image',
+    }));
+    next();
+  } catch (err) {
+    next(err);
+  }
+};
+
+// Middleware: single story upload → req.storyMedia
 const handleStoryUpload = async (req, res, next) => {
   if (!req.file) return next();
-  
   try {
-    const isVideo = req.file.mimetype.startsWith('video/');
-    const filename = uuid() + (isVideo ? '.mp4' : '.jpg');
-    const filepath = path.join(UPLOAD_DIR, 'stories', filename);
-    
-    fs.writeFileSync(filepath, req.file.buffer);
-    req.storyFilename = filename;
-    req.storyIsVideo = isVideo;
+    const result   = await uploadToSupabase(req.file.buffer, req.file.mimetype, 'stories');
+    req.storyMedia = {
+      url:  result.url,
+      path: result.path,
+      type: req.file.mimetype.startsWith('video/') ? 'video' : 'image',
+    };
     next();
   } catch (err) {
-    next(new Error('Failed to process story upload: ' + err.message));
+    next(err);
   }
 };
 
-module.exports = { 
-  upload, 
-  handlePostUpload, 
-  handleAvatarUpload, 
-  handleStoryUpload 
-};
+module.exports = { upload, handleAvatarUpload, handlePostUpload, handleStoryUpload, uploadToSupabase, deleteFromSupabase };
