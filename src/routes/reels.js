@@ -1,44 +1,29 @@
-const express = require('express');
-const router = express.Router();
-const Post = require('../models/Post');
-const User = require('../models/User');
+const router   = require('express').Router();
+const supabase = require('../db/supabase');
 const { optionalAuth } = require('../middleware/auth');
+const { formatPost } = require('../utils/helpers');
 
-// GET reels
 router.get('/', optionalAuth, async (req, res) => {
   try {
-    const { page = 1, limit = 10, cursor } = req.query;
-    const query = { type: 'reel', isDeleted: false };
-    
-    if (cursor) query._id = { $lt: cursor };
-    
-    const reels = await Post.find(query)
-      .populate('user', 'username fullName avatar verified bio followersCount')
-      .sort({ createdAt: -1 })
-      .limit(+limit);
-      
-    res.json({ 
-      success: true, 
-      reels: reels.map(r => ({ 
-        ...r.toObject(), 
-        media: r.mediaUrls, 
-        isLiked: req.user ? r.isLikedBy(req.user._id) : false 
-      })), 
-      nextCursor: reels[reels.length-1]?._id 
-    });
-  } catch (e) {
-    res.status(500).json({ success: false, message: e.message });
-  }
+    const limit = Math.min(20, parseInt(req.query.limit)||10);
+    const { data:reels } = await supabase.from('posts')
+      .select('*, users!user_id(id,username,full_name,avatar,verified,bio,followers_count)')
+      .eq('type','reel').eq('is_deleted',false).order('likes_count',{ascending:false}).limit(limit);
+    let likedSet = new Set();
+    if(req.user && reels?.length){
+      const { data:liked } = await supabase.from('likes').select('post_id').eq('user_id',req.user.id).in('post_id',reels.map(r=>r.id));
+      likedSet = new Set((liked||[]).map(l=>l.post_id));
+    }
+    res.json({ success:true, reels:(reels||[]).map(r=>formatPost({...r,isLiked:likedSet.has(r.id)})) });
+  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
 });
 
-// VIEW reel
 router.post('/:id/view', optionalAuth, async (req, res) => {
   try {
-    await Post.findByIdAndUpdate(req.params.id, { $inc: { viewsCount: 1 } });
-    res.json({ success: true });
-  } catch (e) {
-    res.status(500).json({ success: false, message: e.message });
-  }
+    const { data:p } = await supabase.from('posts').select('id,views_count').eq('id',req.params.id).single();
+    if(p) await supabase.from('posts').update({ views_count:(p.views_count||0)+1 }).eq('id',p.id);
+    res.json({ success:true });
+  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
 });
 
 module.exports = router;
