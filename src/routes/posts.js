@@ -1,203 +1,148 @@
-const router  = require('express').Router();
-const multer  = require('multer');
-const { v4: uuidv4 } = require('uuid');
+const router   = require('express').Router();
 const supabase = require('../db/supabase');
 const { protect, optionalAuth } = require('../middleware/auth');
+const { upload, handlePostUpload } = require('../middleware/upload');
+const { formatPost } = require('../utils/helpers');
+const notify   = require('../utils/notify');
 
-// ── Multer — memory storage (no disk, goes straight to Supabase) ──
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 100 * 1024 * 1024 }, // 100 MB max per file
-  fileFilter: (req, file, cb) => {
-    if (file.mimetype.startsWith('image/') || file.mimetype.startsWith('video/')) cb(null, true);
-    else cb(new Error('Only images and videos are allowed.'));
-  },
-});
-
-// ── Upload a single file buffer → Supabase Storage → returns public URL ──
-async function uploadToSupabase(file) {
-  const ext  = file.originalname.split('.').pop().toLowerCase();
-  const name = `${Date.now()}_${uuidv4()}.${ext}`;
-  const folder = file.mimetype.startsWith('video/') ? 'videos' : 'images';
-  const path = `posts/${folder}/${name}`;
-
-  const { error } = await supabase.storage
-    .from('media')                         // your Supabase bucket name
-    .upload(path, file.buffer, {
-      contentType: file.mimetype,
-      upsert: false,
-    });
-
-  if (error) throw new Error('Storage upload failed: ' + error.message);
-
-  const { data } = supabase.storage.from('media').getPublicUrl(path);
-  return {
-    url:  data.publicUrl,
-    type: file.mimetype.startsWith('video/') ? 'video' : 'image',
-    path,                                  // kept so you can delete it later
-  };
-}
-
-// ── Notify + emit helper ──────────────────────────────────────────────────
-async function notifyAndEmit(io, type, recipientId, senderId, extras = {}) {
-  if (recipientId === senderId) return;
-  const { data: notif } = await supabase
-    .from('notifications')
-    .insert({ type, recipient_id: recipientId, sender_id: senderId, ...extras })
-    .select(`*, sender:users!sender_id(username, avatar, verified)`)
-    .single();
-  if (notif) io.to('user:' + recipientId).emit('notification', notif);
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// POST /api/posts  — create post / reel / story
-// ═══════════════════════════════════════════════════════════════════════════
-router.post('/', protect, upload.array('media', 10), async (req, res) => {
+// ── CREATE POST ────────────────────────────────────────
+router.post('/', protect, upload.array('media', 10), handlePostUpload, async (req, res) => {
   try {
     const { caption = '', location = '', type = 'post', audio } = req.body;
+    const media = req.processedMedia || [];
 
-    if (!req.files || !req.files.length) {
+    if (!media.length) {
       return res.status(400).json({ success: false, message: 'At least one photo or video is required.' });
     }
 
-    // Upload all files in parallel to Supabase Storage
-    const mediaItems = await Promise.all(req.files.map(uploadToSupabase));
-
-    // Extract hashtags from caption
-    const tags = (caption.match(/#[a-zA-Z0-9_]+/g) || []).map(t => t.toLowerCase());
+    const tags     = (caption.match(/#[a-zA-Z0-9_]+/g) || []).map(t => t.toLowerCase());
+    const expiresAt = type === 'story' ? new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString() : null;
 
     const { data: post, error } = await supabase
       .from('posts')
       .insert({
-        user_id:  req.user.id,
+        user_id:    req.user.id,
         type,
+        media,
         caption,
         location,
         tags,
-        media:    mediaItems,            // stored as JSONB
-        audio:    audio ? JSON.parse(audio) : null,
-        expires_at: type === 'story'
-          ? new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()
-          : null,
+        audio:      audio ? JSON.parse(audio) : null,
+        expires_at: expiresAt,
       })
-      .select(`*, user:users!user_id(id, username, full_name, avatar, verified)`)
+      .select(`*, users!user_id(id, username, full_name, avatar, verified)`)
       .single();
 
     if (error) throw error;
 
-    // Increment user post/reel count
-    const countCol = type === 'reel' ? 'reels_count' : 'posts_count';
-    await supabase.rpc('increment_user_count', { user_id: req.user.id, col: countCol });
-    // ☝ Or use a plain update:
-    // await supabase.from('users').update({ posts_count: req.user.posts_count + 1 }).eq('id', req.user.id);
+    // Increment post count
+    const countField = type === 'reel' ? 'reels_count' : 'posts_count';
+    await supabase.from('users').update({ [countField]: (req.user[countField.replace('_count', '_count')] || 0) + 1 }).eq('id', req.user.id);
 
-    // Real-time: notify followers + broadcast to explore
+    // Real-time: notify followers
     const io = req.app.get('io');
-    const { data: followRows } = await supabase
-      .from('follows')
-      .select('follower_id')
-      .eq('following_id', req.user.id);
+    const { data: follows } = await supabase.from('follows').select('follower_id').eq('following_id', req.user.id);
+    (follows || []).forEach(f => io?.to('user:' + f.follower_id).emit('feed_new_post', formatPost(post)));
+    io?.emit('explore_new_post', formatPost(post));
 
-    (followRows || []).forEach(({ follower_id }) =>
-      io.to('user:' + follower_id).emit('feed_new_post', post)
-    );
-    io.emit('explore_new_post', post);
-
-    res.status(201).json({ success: true, post });
+    res.status(201).json({ success: true, post: formatPost(post) });
   } catch (err) {
     console.error('Create post error:', err);
     res.status(500).json({ success: false, message: 'Failed to create post.' });
   }
 });
 
-// ═══════════════════════════════════════════════════════════════════════════
-// GET /api/posts/feed
-// ═══════════════════════════════════════════════════════════════════════════
+// ── FEED ───────────────────────────────────────────────
 router.get('/feed', protect, async (req, res) => {
   try {
-    const page  = parseInt(req.query.page)  || 1;
-    const limit = parseInt(req.query.limit) || 12;
-    const offset = (page - 1) * limit;
+    const page  = Math.max(1, parseInt(req.query.page)  || 1);
+    const limit = Math.min(20, parseInt(req.query.limit) || 12);
 
-    // Who the logged-in user follows
-    const { data: followRows } = await supabase
+    // Get following IDs
+    const { data: follows } = await supabase
       .from('follows')
       .select('following_id')
       .eq('follower_id', req.user.id);
 
-    const followingIds = (followRows || []).map(r => r.following_id);
-    followingIds.push(req.user.id);  // include own posts
+    const followingIds = (follows || []).map(f => f.following_id);
+    followingIds.push(req.user.id);
 
-    const followingLimit    = Math.floor(limit * 0.7);
-    const recommendedLimit  = Math.ceil(limit  * 0.3);
+    const followingLimit   = Math.floor(limit * 0.7);
+    const recommendedLimit = Math.ceil(limit  * 0.3);
+    const offset           = (page - 1) * followingLimit;
 
-    // Posts from people the user follows
+    // Posts from following
     const { data: followingPosts } = await supabase
       .from('posts')
-      .select(`*, user:users!user_id(id, username, full_name, avatar, verified)`)
+      .select(`*, users!user_id(id, username, full_name, avatar, verified)`)
       .in('user_id', followingIds)
       .in('type', ['post', 'reel', 'carousel'])
       .eq('is_deleted', false)
       .order('created_at', { ascending: false })
       .range(offset, offset + followingLimit - 1);
 
-    // Recommended posts (not from following, sorted by engagement)
-    const { data: recommendedPosts } = await supabase
+    // Recommended (not from following)
+    const { data: recommended } = await supabase
       .from('posts')
-      .select(`*, user:users!user_id(id, username, full_name, avatar, verified)`)
+      .select(`*, users!user_id(id, username, full_name, avatar, verified)`)
       .not('user_id', 'in', `(${followingIds.join(',')})`)
       .in('type', ['post', 'reel', 'carousel'])
       .eq('is_deleted', false)
       .order('likes_count', { ascending: false })
       .limit(recommendedLimit);
 
-    // Interleave: every ~3 following posts insert 1 recommended
+    // Interleave
     const merged = [...(followingPosts || [])];
-    (recommendedPosts || []).forEach((rp, i) =>
-      merged.splice(Math.min(i * 3 + 2, merged.length), 0, rp)
-    );
+    (recommended || []).forEach((rp, i) => merged.splice(Math.min(i * 3 + 2, merged.length), 0, rp));
 
-    // Fetch this user's likes and saves to mark isLiked / isSaved
-    const postIds = merged.map(p => p.id);
-
+    // Get my likes and saves
+    const ids = merged.map(p => p.id);
     const [{ data: likedRows }, { data: savedRows }] = await Promise.all([
-      supabase.from('likes').select('post_id').eq('user_id', req.user.id).in('post_id', postIds),
-      supabase.from('saved_posts').select('post_id').eq('user_id', req.user.id).in('post_id', postIds),
+      supabase.from('likes').select('post_id').eq('user_id', req.user.id).in('post_id', ids),
+      supabase.from('saved_posts').select('post_id').eq('user_id', req.user.id).in('post_id', ids),
     ]);
 
     const likedSet = new Set((likedRows || []).map(r => r.post_id));
     const savedSet = new Set((savedRows || []).map(r => r.post_id));
 
-    const enriched = merged.map(p => ({
-      ...p,
-      isLiked: likedSet.has(p.id),
-      isSaved: savedSet.has(p.id),
-    }));
+    const enriched = merged.map(p => formatPost({ ...p, isLiked: likedSet.has(p.id), isSaved: savedSet.has(p.id) }));
 
-    res.json({
-      success: true,
-      posts:   enriched,
-      page,
-      hasMore: (followingPosts || []).length === followingLimit,
-    });
+    res.json({ success: true, posts: enriched, page, hasMore: (followingPosts || []).length === followingLimit });
   } catch (err) {
     console.error('Feed error:', err);
     res.status(500).json({ success: false, message: 'Failed to load feed.' });
   }
 });
 
-// ═══════════════════════════════════════════════════════════════════════════
-// GET /api/posts/user/:userId
-// ═══════════════════════════════════════════════════════════════════════════
+// ── SAVED POSTS ────────────────────────────────────────
+router.get('/saved', protect, async (req, res) => {
+  try {
+    const { data: saved } = await supabase
+      .from('saved_posts')
+      .select(`posts(*, users!user_id(id, username, full_name, avatar, verified))`)
+      .eq('user_id', req.user.id)
+      .order('created_at', { ascending: false });
+
+    res.json({
+      success: true,
+      posts: (saved || []).filter(s => s.posts && !s.posts.is_deleted)
+        .map(s => formatPost({ ...s.posts, isLiked: false, isSaved: true })),
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ── USER POSTS ─────────────────────────────────────────
 router.get('/user/:userId', optionalAuth, async (req, res) => {
   try {
-    const page   = parseInt(req.query.page)  || 1;
-    const limit  = parseInt(req.query.limit) || 12;
+    const page   = Math.max(1, parseInt(req.query.page)  || 1);
+    const limit  = Math.min(30, parseInt(req.query.limit) || 12);
     const offset = (page - 1) * limit;
 
     let query = supabase
       .from('posts')
-      .select(`*, user:users!user_id(id, username, avatar, verified)`)
+      .select(`*, users!user_id(id, username, full_name, avatar, verified)`)
       .eq('user_id', req.params.userId)
       .eq('is_deleted', false)
       .order('created_at', { ascending: false })
@@ -205,41 +150,38 @@ router.get('/user/:userId', optionalAuth, async (req, res) => {
 
     if (req.query.type) query = query.eq('type', req.query.type);
 
-    const { data: posts, error } = await query;
-    if (error) throw error;
+    const { data: posts } = await query;
 
-    // Mark liked if authenticated
     let likedSet = new Set();
     if (req.user && posts?.length) {
-      const { data: likedRows } = await supabase
-        .from('likes').select('post_id')
+      const { data: liked } = await supabase
+        .from('likes')
+        .select('post_id')
         .eq('user_id', req.user.id)
         .in('post_id', posts.map(p => p.id));
-      likedSet = new Set((likedRows || []).map(r => r.post_id));
+      likedSet = new Set((liked || []).map(r => r.post_id));
     }
 
     res.json({
       success: true,
-      posts: (posts || []).map(p => ({ ...p, isLiked: likedSet.has(p.id) })),
+      posts: (posts || []).map(p => formatPost({ ...p, isLiked: likedSet.has(p.id) })),
     });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Failed to load posts.' });
+    res.status(500).json({ success: false, message: err.message });
   }
 });
 
-// ═══════════════════════════════════════════════════════════════════════════
-// GET /api/posts/:id
-// ═══════════════════════════════════════════════════════════════════════════
+// ── SINGLE POST ────────────────────────────────────────
 router.get('/:id', optionalAuth, async (req, res) => {
   try {
-    const { data: post, error } = await supabase
+    const { data: post } = await supabase
       .from('posts')
-      .select(`*, user:users!user_id(id, username, full_name, avatar, verified, bio)`)
+      .select(`*, users!user_id(id, username, full_name, avatar, verified, bio)`)
       .eq('id', req.params.id)
       .eq('is_deleted', false)
-      .single();
+      .maybeSingle();
 
-    if (error || !post) return res.status(404).json({ success: false, message: 'Post not found.' });
+    if (!post) return res.status(404).json({ success: false, message: 'Post not found.' });
 
     let isLiked = false, isSaved = false;
     if (req.user) {
@@ -251,172 +193,106 @@ router.get('/:id', optionalAuth, async (req, res) => {
       isSaved = !!save;
     }
 
-    res.json({ success: true, post: { ...post, isLiked, isSaved } });
+    res.json({ success: true, post: formatPost({ ...post, isLiked, isSaved }) });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Failed to load post.' });
+    res.status(500).json({ success: false, message: err.message });
   }
 });
 
-// ═══════════════════════════════════════════════════════════════════════════
-// POST /api/posts/:id/like  — toggle like
-// ═══════════════════════════════════════════════════════════════════════════
+// ── LIKE / UNLIKE ──────────────────────────────────────
 router.post('/:id/like', protect, async (req, res) => {
   try {
-    const postId = req.params.id;
-    const userId = req.user.id;
+    const { data: post } = await supabase.from('posts').select('id, likes_count, user_id').eq('id', req.params.id).single();
+    if (!post) return res.status(404).json({ success: false, message: 'Post not found.' });
 
-    // Check if already liked
-    const { data: existing } = await supabase
-      .from('likes')
-      .select('post_id')
-      .eq('user_id', userId)
-      .eq('post_id', postId)
-      .maybeSingle();
+    const { data: existing } = await supabase.from('likes').select('post_id')
+      .eq('user_id', req.user.id).eq('post_id', post.id).maybeSingle();
 
-    let liked, likesCount;
-
+    let liked, newCount;
     if (existing) {
-      // Unlike
-      await supabase.from('likes').delete().eq('user_id', userId).eq('post_id', postId);
-      const { data: post } = await supabase
-        .from('posts')
-        .update({ likes_count: supabase.rpc('greatest', { a: 0, b: -1 }) })
-        // simpler alternative below:
-        .eq('id', postId)
-        .select('likes_count, user_id')
-        .single();
-
-      // Decrement safely
-      await supabase.rpc('decrement_likes', { post_id: postId });
-      const { data: updated } = await supabase.from('posts').select('likes_count, user_id').eq('id', postId).single();
+      await supabase.from('likes').delete().eq('user_id', req.user.id).eq('post_id', post.id);
+      newCount = Math.max(0, (post.likes_count || 1) - 1);
+      await supabase.from('posts').update({ likes_count: newCount }).eq('id', post.id);
       liked = false;
-      likesCount = updated.likes_count;
     } else {
-      // Like
-      await supabase.from('likes').insert({ user_id: userId, post_id: postId });
-      await supabase.rpc('increment_likes', { post_id: postId });
-      const { data: updated } = await supabase.from('posts').select('likes_count, user_id').eq('id', postId).single();
+      await supabase.from('likes').insert({ user_id: req.user.id, post_id: post.id });
+      newCount = (post.likes_count || 0) + 1;
+      await supabase.from('posts').update({ likes_count: newCount }).eq('id', post.id);
       liked = true;
-      likesCount = updated.likes_count;
-
-      // Notify post owner
       const io = req.app.get('io');
-      await notifyAndEmit(io, 'like', updated.user_id, userId, {
-        post_id: postId,
-        message: req.user.username + ' liked your photo',
-      });
+      await notify(io, { type: 'like', recipientId: post.user_id, senderId: req.user.id, postId: post.id, message: `${req.user.username} liked your photo` });
     }
 
-    // Broadcast live like count to all connected clients
-    req.app.get('io').emit('post_like_update', { postId, likesCount, liked, byUserId: userId });
-
-    res.json({ success: true, liked, likesCount });
+    req.app.get('io')?.emit('post_like_update', { postId: post.id, likesCount: newCount, liked, byUserId: req.user.id });
+    res.json({ success: true, liked, likesCount: newCount });
   } catch (err) {
-    console.error('Like error:', err);
-    res.status(500).json({ success: false, message: 'Failed to update like.' });
+    res.status(500).json({ success: false, message: err.message });
   }
 });
 
-// ═══════════════════════════════════════════════════════════════════════════
-// POST /api/posts/:id/save  — toggle save
-// ═══════════════════════════════════════════════════════════════════════════
+// ── SAVE / UNSAVE ──────────────────────────────────────
 router.post('/:id/save', protect, async (req, res) => {
   try {
-    const postId = req.params.id;
-    const userId = req.user.id;
+    const { data: post } = await supabase.from('posts').select('id, saves_count').eq('id', req.params.id).single();
+    if (!post) return res.status(404).json({ success: false, message: 'Post not found.' });
 
-    const { data: existing } = await supabase
-      .from('saved_posts')
-      .select('post_id')
-      .eq('user_id', userId)
-      .eq('post_id', postId)
-      .maybeSingle();
+    const { data: existing } = await supabase.from('saved_posts').select('post_id')
+      .eq('user_id', req.user.id).eq('post_id', post.id).maybeSingle();
 
-    let saved;
+    let saved, newCount;
     if (existing) {
-      await supabase.from('saved_posts').delete().eq('user_id', userId).eq('post_id', postId);
-      await supabase.rpc('decrement_saves', { post_id: postId });
+      await supabase.from('saved_posts').delete().eq('user_id', req.user.id).eq('post_id', post.id);
+      newCount = Math.max(0, (post.saves_count || 1) - 1);
       saved = false;
     } else {
-      await supabase.from('saved_posts').insert({ user_id: userId, post_id: postId });
-      await supabase.rpc('increment_saves', { post_id: postId });
+      await supabase.from('saved_posts').insert({ user_id: req.user.id, post_id: post.id });
+      newCount = (post.saves_count || 0) + 1;
       saved = true;
     }
-
-    const { data: post } = await supabase.from('posts').select('saves_count').eq('id', postId).single();
-    res.json({ success: true, saved, savesCount: post?.saves_count || 0 });
+    await supabase.from('posts').update({ saves_count: newCount }).eq('id', post.id);
+    res.json({ success: true, saved, savesCount: newCount });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Failed to save post.' });
+    res.status(500).json({ success: false, message: err.message });
   }
 });
 
-// ═══════════════════════════════════════════════════════════════════════════
-// DELETE /api/posts/:id
-// ═══════════════════════════════════════════════════════════════════════════
+// ── DELETE POST ────────────────────────────────────────
 router.delete('/:id', protect, async (req, res) => {
   try {
-    const { data: post } = await supabase
-      .from('posts')
-      .select('id, user_id, media, type')
-      .eq('id', req.params.id)
-      .single();
-
+    const { data: post } = await supabase.from('posts').select('id, user_id, type').eq('id', req.params.id).single();
     if (!post) return res.status(404).json({ success: false, message: 'Post not found.' });
     if (post.user_id !== req.user.id) return res.status(403).json({ success: false, message: 'Not authorized.' });
 
-    // Soft-delete the post row
     await supabase.from('posts').update({ is_deleted: true }).eq('id', post.id);
+    const countField = post.type === 'reel' ? 'reels_count' : 'posts_count';
+    await supabase.from('users').update({ [countField]: Math.max(0, (req.user[countField] || 1) - 1) }).eq('id', req.user.id);
 
-    // Delete media files from Supabase Storage
-    if (post.media?.length) {
-      const paths = post.media.map(m => m.path).filter(Boolean);
-      if (paths.length) await supabase.storage.from('media').remove(paths);
-    }
-
-    // Decrement user count
-    const countCol = post.type === 'reel' ? 'reels_count' : 'posts_count';
-    await supabase.rpc('decrement_user_count', { user_id: req.user.id, col: countCol });
-
-    req.app.get('io').emit('post_deleted', { postId: post.id });
+    req.app.get('io')?.emit('post_deleted', { postId: post.id });
     res.json({ success: true, message: 'Post deleted.' });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Failed to delete post.' });
+    res.status(500).json({ success: false, message: err.message });
   }
 });
 
-// ═══════════════════════════════════════════════════════════════════════════
-// PUT /api/posts/:id  — edit caption / settings
-// ═══════════════════════════════════════════════════════════════════════════
+// ── EDIT POST ──────────────────────────────────────────
 router.put('/:id', protect, async (req, res) => {
   try {
-    const { caption, location, commentsDisabled, likesHidden } = req.body;
-
-    const { data: post } = await supabase
-      .from('posts')
-      .select('id, user_id')
-      .eq('id', req.params.id)
-      .single();
-
+    const { data: post } = await supabase.from('posts').select('id, user_id').eq('id', req.params.id).single();
     if (!post) return res.status(404).json({ success: false, message: 'Post not found.' });
     if (post.user_id !== req.user.id) return res.status(403).json({ success: false, message: 'Not authorized.' });
 
     const updates = {};
-    if (caption           !== undefined) updates.caption            = caption;
-    if (location          !== undefined) updates.location           = location;
-    if (commentsDisabled  !== undefined) updates.comments_disabled  = commentsDisabled;
-    if (likesHidden       !== undefined) updates.likes_hidden       = likesHidden;
+    if (req.body.caption          !== undefined) updates.caption           = req.body.caption;
+    if (req.body.location         !== undefined) updates.location          = req.body.location;
+    if (req.body.commentsDisabled !== undefined) updates.comments_disabled = req.body.commentsDisabled;
+    if (req.body.likesHidden      !== undefined) updates.likes_hidden      = req.body.likesHidden;
 
-    const { data: updated, error } = await supabase
-      .from('posts')
-      .update(updates)
-      .eq('id', post.id)
-      .select()
-      .single();
+    const { data: updated } = await supabase.from('posts').update(updates).eq('id', post.id)
+      .select(`*, users!user_id(id, username, full_name, avatar, verified)`).single();
 
-    if (error) throw error;
-    res.json({ success: true, post: updated });
+    res.json({ success: true, post: formatPost(updated) });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Failed to edit post.' });
+    res.status(500).json({ success: false, message: err.message });
   }
 });
 
