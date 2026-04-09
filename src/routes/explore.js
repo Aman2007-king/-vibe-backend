@@ -1,37 +1,26 @@
-const express = require('express');
-const router = express.Router();
-const Post = require('../models/Post');
-const User = require('../models/User');
+const router   = require('express').Router();
+const supabase = require('../db/supabase');
 const { optionalAuth } = require('../middleware/auth');
+const { formatPost } = require('../utils/helpers');
 
-// GET explore feed
 router.get('/', optionalAuth, async (req, res) => {
   try {
-    const { page = 1, limit = 30 } = req.query;
-    let exclude = [];
-    
-    if (req.user) {
-      const user = await User.findById(req.user._id).select('following');
-      exclude = [...(user.following || []), req.user._id];
+    const limit  = Math.min(30, parseInt(req.query.limit)||30);
+    const page   = Math.max(1, parseInt(req.query.page)||1);
+    const offset = (page-1)*limit;
+    let excludeIds = [];
+    if(req.user){
+      const { data:f } = await supabase.from('follows').select('following_id').eq('follower_id',req.user.id);
+      excludeIds = [...(f||[]).map(x=>x.following_id), req.user.id];
     }
-    
-    const posts = await Post.find({ 
-      user: req.user ? { $nin: exclude } : {}, 
-      isDeleted: false, 
-      'media.0': { $exists: true } 
-    })
-      .populate('user', 'username avatar verified')
-      .sort({ engagementScore: -1, createdAt: -1 })
-      .skip((page-1)*limit)
-      .limit(+limit);
-      
-    res.json({ 
-      success: true, 
-      posts: posts.map(p => ({ ...p.toObject(), media: p.mediaUrls })) 
-    });
-  } catch (e) {
-    res.status(500).json({ success: false, message: e.message });
-  }
+    let query = supabase.from('posts')
+      .select('*, users!user_id(id,username,full_name,avatar,verified)')
+      .in('type',['post','reel']).eq('is_deleted',false)
+      .order('likes_count',{ascending:false}).range(offset, offset+limit-1);
+    if(excludeIds.length) query = query.not('user_id','in',`(${excludeIds.join(',')})`);
+    const { data:posts } = await query;
+    res.json({ success:true, posts:(posts||[]).map(p=>formatPost(p)) });
+  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
 });
 
 module.exports = router;
