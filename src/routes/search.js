@@ -1,53 +1,18 @@
-const express = require('express');
-const router = express.Router();
-const User = require('../models/User');
-const Post = require('../models/Post');
+const router   = require('express').Router();
+const supabase = require('../db/supabase');
 const { optionalAuth } = require('../middleware/auth');
+const { formatUser, formatPost } = require('../utils/helpers');
 
-// SEARCH
 router.get('/', optionalAuth, async (req, res) => {
   try {
-    const { q, type = 'all' } = req.query;
-    if (!q?.trim()) return res.json({ success: true, users: [], posts: [], hashtags: [] });
-    
-    const results = {};
-    
-    if (type === 'all' || type === 'users') {
-      results.users = await User.find({ 
-        $or: [
-          { username: { $regex: q, $options: 'i' } },
-          { fullName: { $regex: q, $options: 'i' } }
-        ], 
-        isActive: true 
-      })
-        .select('username fullName avatar verified bio followersCount')
-        .limit(10);
-        
-      results.users = results.users.map(u => ({ 
-        ...u.toObject(), 
-        avatar: u.avatarUrl 
-      }));
-    }
-    
-    if (type === 'all' || type === 'posts') {
-      results.posts = await Post.find({ 
-        caption: { $regex: q, $options: 'i' }, 
-        isDeleted: false 
-      })
-        .populate('user', 'username avatar verified')
-        .sort({ engagementScore: -1 })
-        .limit(20);
-        
-      results.posts = results.posts.map(p => ({ 
-        ...p.toObject(), 
-        media: p.mediaUrls 
-      }));
-    }
-    
-    res.json({ success: true, ...results });
-  } catch (e) {
-    res.status(500).json({ success: false, message: e.message });
-  }
+    const q = (req.query.q||'').trim();
+    if(!q) return res.json({ success:true, users:[], posts:[] });
+    const [{ data:users },{ data:posts }] = await Promise.all([
+      supabase.from('users').select('id,username,full_name,avatar,verified,bio,followers_count').or(`username.ilike.%${q}%,full_name.ilike.%${q}%`).eq('is_active',true).limit(10),
+      supabase.from('posts').select('*, users!user_id(id,username,full_name,avatar,verified)').or(`caption.ilike.%${q}%,location.ilike.%${q}%`).eq('is_deleted',false).order('likes_count',{ascending:false}).limit(15),
+    ]);
+    res.json({ success:true, users:(users||[]).map(formatUser), posts:(posts||[]).map(p=>formatPost(p)) });
+  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
 });
 
 module.exports = router;
