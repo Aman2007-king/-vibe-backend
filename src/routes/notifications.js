@@ -1,41 +1,27 @@
-const express = require('express');
-const router = express.Router();
-const { Notification } = require('../models/index');
-const { protect, optionalAuth } = require('../middleware/auth');
+const router   = require('express').Router();
+const supabase = require('../db/supabase');
+const { protect } = require('../middleware/auth');
 
-// GET notifications
 router.get('/', protect, async (req, res) => {
   try {
-    const { page = 1, limit = 30 } = req.query;
-    const notifs = await Notification.find({ recipient: req.user._id })
-      .populate('sender', 'username avatar verified')
-      .populate('post', 'media')
-      .sort({ createdAt: -1 })
-      .skip((page-1)*limit)
-      .limit(+limit);
-      
-    const unreadCount = await Notification.countDocuments({ 
-      recipient: req.user._id, 
-      isRead: false 
-    });
-    
-    res.json({ success: true, notifications: notifs, unreadCount });
-  } catch (e) {
-    res.status(500).json({ success: false, message: e.message });
-  }
+    const limit = Math.min(50, parseInt(req.query.limit)||30);
+    const { data } = await supabase.from('notifications')
+      .select('*, sender:users!sender_id(id,username,full_name,avatar,verified), post:posts!post_id(id,media,caption)')
+      .eq('recipient_id',req.user.id).order('created_at',{ascending:false}).limit(limit);
+    await supabase.from('notifications').update({ is_read:true, read_at:new Date().toISOString() }).eq('recipient_id',req.user.id).eq('is_read',false);
+    res.json({ success:true, notifications:(data||[]).map(n=>({
+      id:n.id, _id:n.id, type:n.type, message:n.message, isRead:n.is_read, createdAt:n.created_at,
+      sender: n.sender ? { id:n.sender.id, _id:n.sender.id, username:n.sender.username, fullName:n.sender.full_name, avatar:n.sender.avatar||`https://ui-avatars.com/api/?name=${encodeURIComponent(n.sender.full_name||'U')}&background=0095f6&color=fff`, verified:n.sender.verified||false } : null,
+      post: n.post || null,
+    })) });
+  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
 });
 
-// MARK all notifications as read
-router.put('/read-all', protect, async (req, res) => {
+router.get('/unread-count', protect, async (req, res) => {
   try {
-    await Notification.updateMany(
-      { recipient: req.user._id, isRead: false }, 
-      { isRead: true, readAt: new Date() }
-    );
-    res.json({ success: true });
-  } catch (e) {
-    res.status(500).json({ success: false, message: e.message });
-  }
+    const { count } = await supabase.from('notifications').select('*',{count:'exact',head:true}).eq('recipient_id',req.user.id).eq('is_read',false);
+    res.json({ success:true, count:count||0 });
+  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
 });
 
 module.exports = router;
