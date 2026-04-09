@@ -56,6 +56,21 @@ function initSocket(io) {
       });
     });
 
+    SOCKET.on('new_message', d => {
+  // Only process messages from OTHER people — sender already sees their own
+  const senderId = d.message?.sender?.id || d.message?.sender?._id || d.message?.senderId || '';
+  const myId     = CU?._id || CU?.id || '';
+  if(senderId === myId) return; // ignore own messages echoed back
+
+  if(activeChatId === d.conversationId){
+    appendChatMsg(d.message, false);
+  } else {
+    // Show badge notification
+    ['sb-msg-badge','tb-msg-badge','bn-msg-badge'].forEach(id=>{
+      const el=$(id); if(el) el.style.display='flex';
+    });
+  }
+});
     // ── NEW COMMENT ────────────────────────────────────
     socket.on('new_comment', (data) => {
       io.emit('comment_added', {
