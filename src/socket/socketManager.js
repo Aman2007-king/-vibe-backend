@@ -1,11 +1,11 @@
 const jwt      = require('jsonwebtoken');
 const supabase = require('../db/supabase');
 
-const onlineUsers  = new Map(); // userId → Set of socketIds
+const onlineUsers  = new Map();
 const typingTimers = new Map();
 
 function initSocket(io) {
-  // Auth middleware
+  // Auth middleware — uses Supabase NOT MongoDB
   io.use(async (socket, next) => {
     try {
       const token =
@@ -14,16 +14,17 @@ function initSocket(io) {
       if (!token) return next(new Error('Authentication required'));
 
       const decoded = jwt.verify(token, process.env.JWT_SECRET);
-      const { data: user } = await supabase
+      const { data: user, error } = await supabase
         .from('users')
-        .select('id, username, full_name, avatar, verified, followers_count')
+        .select('id, username, full_name, avatar, verified, is_active')
         .eq('id', decoded.id)
         .single();
 
-      if (!user) return next(new Error('User not found'));
+      if (error || !user) return next(new Error('User not found'));
+      if (!user.is_active) return next(new Error('Account deactivated'));
       socket.user = user;
       next();
-    } catch {
+    } catch (err) {
       next(new Error('Invalid token'));
     }
   });
@@ -32,12 +33,11 @@ function initSocket(io) {
     const userId = socket.user.id;
     console.log('🟢', socket.user.username, 'connected');
 
-    // Track socket
+    // Track online
     if (!onlineUsers.has(userId)) onlineUsers.set(userId, new Set());
     onlineUsers.get(userId).add(socket.id);
     socket.join('user:' + userId);
 
-    // Notify followers this user is online
     notifyFollowersOnlineStatus(io, socket.user, true);
     io.emit('online_count', onlineUsers.size);
 
@@ -56,68 +56,22 @@ function initSocket(io) {
       });
     });
 
-    SOCKET.on('new_message', d => {
-  // Only process messages from OTHER people — sender already sees their own
-  const senderId = d.message?.sender?.id || d.message?.sender?._id || d.message?.senderId || '';
-  const myId     = CU?._id || CU?.id || '';
-  if(senderId === myId) return; // ignore own messages echoed back
-
-  if(activeChatId === d.conversationId){
-    appendChatMsg(d.message, false);
-  } else {
-    // Show badge notification
-    ['sb-msg-badge','tb-msg-badge','bn-msg-badge'].forEach(id=>{
-      const el=$(id); if(el) el.style.display='flex';
-    });
-  }
-});
-    // ── NEW COMMENT ────────────────────────────────────
+    // ── COMMENT ────────────────────────────────────────
     socket.on('new_comment', (data) => {
       io.emit('comment_added', {
         postId:  data.postId,
-        comment: { ...data.comment, user: { id: userId, username: socket.user.username, avatar: socket.user.avatar } },
+        comment: {
+          ...data.comment,
+          user: { id: userId, username: socket.user.username, avatar: socket.user.avatar },
+        },
       });
     });
 
-    // ── MESSAGES ───────────────────────────────────────
-    socket.on('join_conversation', (conversationId) => {
-      socket.join('conv:' + conversationId);
-    });
-    socket.on('leave_conversation', (conversationId) => {
-      socket.leave('conv:' + conversationId);
-    });
+    // ── CONVERSATIONS ──────────────────────────────────
+    socket.on('join_conversation',  (cid) => socket.join('conv:' + cid));
+    socket.on('leave_conversation', (cid) => socket.leave('conv:' + cid));
 
-    socket.on('send_message', (data) => {
-      const payload = {
-        ...data.message,
-        senderId:       userId,
-        senderUsername: socket.user.username,
-        senderAvatar:   socket.user.avatar,
-        ts:             Date.now(),
-        status:         'delivered',
-      };
-      io.to('conv:' + data.conversationId).emit('new_message', {
-        conversationId: data.conversationId,
-        message:        payload,
-      });
-      if (data.recipientId) {
-        io.to('user:' + data.recipientId).emit('dm_notification', {
-          conversationId: data.conversationId,
-          from:    { id: userId, username: socket.user.username, avatar: socket.user.avatar },
-          preview: data.message.text ? data.message.text.slice(0, 50) : '📷 Photo',
-          ts:      Date.now(),
-        });
-      }
-    });
-
-    socket.on('message_seen', (data) => {
-      io.to('conv:' + data.conversationId).emit('messages_read', {
-        conversationId: data.conversationId,
-        readBy:         userId,
-        readAt:         Date.now(),
-      });
-    });
-
+    // ── TYPING ─────────────────────────────────────────
     socket.on('typing_start', (data) => {
       socket.to('conv:' + data.conversationId).emit('user_typing', {
         conversationId: data.conversationId,
@@ -145,10 +99,10 @@ function initSocket(io) {
       });
     });
 
-    // ── FOLLOW EVENT ───────────────────────────────────
+    // ── FOLLOW ─────────────────────────────────────────
     socket.on('follow_user', (data) => {
       io.to('user:' + data.targetUserId).emit('new_follower', {
-        from: { id: userId, username: socket.user.username, avatar: socket.user.avatar },
+        from: { id: userId, username: socket.user.username, avatar: socket.user.avatar || '' },
         ts:   Date.now(),
       });
     });
@@ -157,7 +111,7 @@ function initSocket(io) {
     socket.on('story_view', (data) => {
       io.to('user:' + data.storyOwnerId).emit('story_viewed', {
         storyId:  data.storyId,
-        viewedBy: { id: userId, username: socket.user.username, avatar: socket.user.avatar },
+        viewedBy: { id: userId, username: socket.user.username, avatar: socket.user.avatar || '' },
         ts:       Date.now(),
       });
     });
@@ -171,8 +125,10 @@ function initSocket(io) {
         if (sockets.size === 0) {
           onlineUsers.delete(userId);
           notifyFollowersOnlineStatus(io, socket.user, false);
-          // Update last_seen in Supabase
-          supabase.from('users').update({ last_seen: new Date().toISOString() }).eq('id', userId).then(() => {});
+          supabase.from('users')
+            .update({ last_seen: new Date().toISOString() })
+            .eq('id', userId)
+            .then(() => {});
         }
       }
       io.emit('online_count', onlineUsers.size);
@@ -194,14 +150,15 @@ async function notifyFollowersOnlineStatus(io, user, isOnline) {
         userId:   user.id,
         username: user.username,
         isOnline,
-        lastSeen: isOnline ? null : new Date(),
+        lastSeen: isOnline ? null : new Date().toISOString(),
       });
     });
   } catch {}
 }
 
 function isUserOnline(userId) {
-  return onlineUsers.has(userId?.toString());
+  if (!userId) return false;
+  return onlineUsers.has(userId.toString());
 }
 
 module.exports = { initSocket, isUserOnline };
